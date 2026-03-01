@@ -1,0 +1,30 @@
+
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ML model files (Railway will retrain from DB)
+bot_model.pkl
+bot_scaler.pkl
+
+# Logs (Railway has its own log viewer)
+*.log
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
