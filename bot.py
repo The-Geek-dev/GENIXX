@@ -60,13 +60,13 @@ DATABASE_URL = _db_url  # asyncpg accepts postgresql:// natively
 
 JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"
-JUPITER_PRICE_API = "https://price.jup.ag/v4/price"  # fallback only
+JUPITER_PRICE_API = "https://lite-api.jup.ag/price/v2"  # v2 lite endpoint (price.jup.ag deprecated)
 DEXSCREENER_API   = "https://api.dexscreener.com/latest/dex/tokens/"
 RUGCHECK_API      = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
 RUGCHECK_SCORE_MIN = int(os.getenv("RUGCHECK_SCORE_MIN", "500"))  # lower = safer
 HELIUS_RPC        = os.getenv("HELIUS_RPC", "")  # optional: wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 USDC_MINT         = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-SEEN_EXPIRY_SEC   = 120  # re-evaluate tokens after 2 minutes
+SEEN_EXPIRY_SEC   = 1800  # re-evaluate tokens after 30 minutes
 
 # Conversation states — unique values, no collisions
 WAITING_BUY_MINT    = 0
@@ -1030,6 +1030,11 @@ async def auto_sniper_loop(app):
                     log.error(f"evaluate error {mint[:8]}: {info}"); continue
                 log.info(f"Sniper: {info['symbol']} passes={info['passes_rules']} liq=${info['liquidity']:,.0f} ml={info['ml_score']:.0%}")
                 if not info["passes_rules"]: continue
+
+                # Skip if already holding this token (prevents duplicate buys after expiry)
+                if mint in state["positions"] or mint in state["demo_positions"]:
+                    log.debug(f"Sniper: {info['symbol']} already in positions, skipping")
+                    continue
 
                 risks = ", ".join([r.get("name","") for r in info["safety"].get("risks",[])]) or "None"
                 notif = (
