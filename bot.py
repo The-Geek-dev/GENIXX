@@ -1273,11 +1273,14 @@ async def _button_handler_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
                 pnl  = (mult-1)*pos["amount_usd"] - pos["fees_paid"]
                 proj = pnl*(state["settings"]["trade_amount"]/state["settings"]["demo_trade_amount"])
                 e    = "🟢" if pnl >= 0 else "🔴"
-                lines.append(f"{e} *{pos['symbol']}* | {mult:.2f}x | Sim: ${pnl:+.2f} | Real: *${proj:+.2f}*")
+                tp_tag = " 🎯" if pos.get("tp_hit") else ""
+                lines.append(f"{e} *{pos['symbol']}*{tp_tag} | {mult:.2f}x | Sim: ${pnl:+.2f} | Real: *${proj:+.2f}*")
             await q.edit_message_text(
                 f"📝 *Demo Positions*\n\n" + "\n".join(lines) +
-                f"\n\n📊 Total Demo P&L: ${state['demo_total_pnl']:+.2f}",
-                parse_mode="Markdown", reply_markup=kb_main())
+                f"\n\n📊 Total Demo P&L: ${state['demo_total_pnl']:+.2f}\n"
+                f"_Tap a token below to close it_",
+                parse_mode="Markdown",
+                reply_markup=kb_positions(state["demo_positions"], is_demo=True))
 
     elif data == "demohistory":
         if not state["demo_trades"]:
