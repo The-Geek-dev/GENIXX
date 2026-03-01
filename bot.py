@@ -616,13 +616,18 @@ def kb_confirm_sell(mint):
 
 def kb_positions(positions: dict, is_demo=False):
     """Dynamic keyboard showing open positions as buttons."""
-    prefix = "dsell" if is_demo else "sell_confirm"
-    rows   = []
+    rows = []
     for mint, pos in positions.items():
-        rows.append([InlineKeyboardButton(
-            f"💸 Sell {pos['symbol']}",
-            callback_data=f"{prefix}:{mint}"
-        )])
+        if is_demo:
+            rows.append([
+                InlineKeyboardButton(f"💸 Close {pos['symbol']}", callback_data=f"dsell:{mint}"),
+                InlineKeyboardButton("✂️ Take Profit Now", callback_data=f"dclose_now:{mint}")
+            ])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"💸 Sell {pos['symbol']}",
+                callback_data=f"sell_confirm:{mint}"
+            )])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -1103,6 +1108,7 @@ async def auto_sniper_loop(app):
 # ============================================================
 async def monitor_positions(app):
     log.info("Position monitor started.")
+    price_history: dict = {}  # mint -> list of (timestamp, price) for momentum detection
     while True:
         await asyncio.sleep(2)
         for is_demo, pool in [(False, state["positions"]), (True, state["demo_positions"])]:
@@ -1114,22 +1120,54 @@ async def monitor_positions(app):
                     entry  = pos["entry_price"]; mult = price/entry
                     tp     = state["settings"]["take_profit"]
                     sl     = state["settings"]["stop_loss"]
-                    trail  = state["settings"]["trailing_stop"]/100
-                    if price > pos.get("peak_price", entry): pos["peak_price"] = price
-                    trailing_trigger = pos["peak_price"]*(1-trail)
+
+                    # Track price history for momentum (keep last 10 readings ~20s window)
+                    if mint not in price_history:
+                        price_history[mint] = []
+                    price_history[mint].append((time.time(), price))
+                    if len(price_history[mint]) > 10:
+                        price_history[mint].pop(0)
+
+                    # Update peak price
+                    if price > pos.get("peak_price", entry):
+                        pos["peak_price"] = price
+
+                    # After TP: use tight 5% trail instead of configured % to catch dumps fast
+                    post_tp_trail    = 0.05
+                    trailing_trigger = pos["peak_price"] * (1 - post_tp_trail)
+
                     reason = None
+
                     if mult <= sl:
                         reason = f"🔴 Stop Loss at {mult:.2f}x"
-                    elif pos.get("tp_hit") and price <= trailing_trigger:
-                        reason = f"🟡 Trailing Stop at {mult:.2f}x"
+
+                    elif pos.get("tp_hit"):
+                        # Momentum check: if price dropped >3% in last ~8s, exit immediately
+                        hist = price_history.get(mint, [])
+                        momentum_exit = False
+                        if len(hist) >= 4:
+                            old_price = hist[-4][1]
+                            drop_pct  = (old_price - price) / old_price if old_price > 0 else 0
+                            if drop_pct > 0.03:
+                                momentum_exit = True
+                                log.info(f"Momentum exit: {pos['symbol']} -{drop_pct:.1%} in ~8s")
+
+                        if price <= trailing_trigger:
+                            reason = f"🟡 Trailing Stop at {mult:.2f}x"
+                        elif momentum_exit:
+                            reason = f"⚡ Momentum Exit at {mult:.2f}x"
+
                     elif mult >= tp and not pos.get("tp_hit"):
                         pos["tp_hit"] = True
                         await db_save_position(mint, pos, is_demo)
                         pfx = "📝 DEMO " if is_demo else ""
                         await _safe_notify(app,
                             f"{pfx}🎯 *TP Hit — {pos['symbol']}* {mult:.2f}x\n"
-                            f"Trailing stop now active! 🚀")
+                            f"Trailing stop now active! 🚀\n"
+                            f"_5% tight trail engaged_")
+
                     if reason:
+                        price_history.pop(mint, None)
                         await _close_position(app, mint, pos, price, reason, is_demo)
                 except Exception as e:
                     log_error(f"monitor/{mint[:8]}", e)
@@ -1402,6 +1440,55 @@ async def _button_handler_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         await q.edit_message_text(f"⏳ Selling {pos['symbol']}...", parse_mode="Markdown")
         price = await get_token_price(mint) or pos["entry_price"]
         await _close_position(None, mint, pos, price, "Manual sell", False)
+        msg = await build_dashboard()
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb_main())
+
+    # ── Demo: manual close (at current price) ──
+    elif data.startswith("dsell:"):
+        mint = data.split(":")[1]
+        if mint not in state["demo_positions"]:
+            await q.edit_message_text("❌ Demo position not found.", reply_markup=kb_main())
+            return
+        pos = state["demo_positions"][mint]
+        price = await get_token_price(mint)
+        if price <= 0:
+            await q.edit_message_text("❌ Price unavailable, try again.", reply_markup=kb_main())
+            return
+        mult = price / pos["entry_price"]
+        await q.edit_message_text(
+            f"💸 *Close Demo Position*\n\n"
+            f"Token: *{pos['symbol']}*\n"
+            f"Entry: ${pos['entry_price']:.6f}\n"
+            f"Current: ${price:.6f} ({mult:.2f}x)\n\n"
+            f"Close at current price?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm Close", callback_data=f"dclose_confirm:{mint}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="demostatus")]
+            ]))
+
+    elif data.startswith("dclose_confirm:"):
+        mint = data.split(":")[1]
+        if mint not in state["demo_positions"]:
+            await q.edit_message_text("❌ Demo position not found.", reply_markup=kb_main())
+            return
+        pos = state["demo_positions"][mint]
+        price = await get_token_price(mint) or pos["entry_price"]
+        await q.edit_message_text(f"⏳ Closing {pos['symbol']}...", parse_mode="Markdown")
+        await _close_position(app, mint, pos, price, "✂️ Manual Close", True)
+        msg = await build_dashboard()
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb_main())
+
+    # ── Demo: take profit now (close at current price immediately, no confirm) ──
+    elif data.startswith("dclose_now:"):
+        mint = data.split(":")[1]
+        if mint not in state["demo_positions"]:
+            await q.edit_message_text("❌ Demo position not found.", reply_markup=kb_main())
+            return
+        pos = state["demo_positions"][mint]
+        price = await get_token_price(mint) or pos["entry_price"]
+        await q.edit_message_text(f"✂️ Taking profit on {pos['symbol']}...", parse_mode="Markdown")
+        await _close_position(app, mint, pos, price, "✂️ Manual Take Profit", True)
         msg = await build_dashboard()
         await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb_main())
 
