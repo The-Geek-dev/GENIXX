@@ -10,7 +10,7 @@ import joblib
 import base58
 import asyncpg
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from datetime import datetime
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -85,12 +85,10 @@ WAITING_SET_TRAIL_50X = 23
 WAITING_SET_MIN_AGE   = 24
 WAITING_SET_VOL5M     = 25
 WAITING_SET_MAX_DEMO  = 26
-WAITING_SET_MAX_REAL   = 27
-WAITING_SET_PT_5X      = 30
-WAITING_SET_PT_10X     = 31
-WAITING_SET_PT_20X     = 32
-WAITING_SET_DAILY_LOSS = 33
-WAITING_SET_BE_MULT    = 35
+WAITING_SET_MAX_REAL  = 27
+WAITING_SET_PT_5X     = 30
+WAITING_SET_PT_10X    = 31
+WAITING_SET_PT_20X    = 32
 
 def validate_config():
     missing = [k for k, v in {
@@ -103,7 +101,6 @@ def validate_config():
     log.info("Config validated")
 
 keypair = solana_client = db_pool = None
-_app_ref = None  # global app ref for stale feed alerts
 
 # ============================================================
 # STATE
@@ -114,10 +111,6 @@ state = {
     "total_pnl": 0.0, "trades_history": [],
     "seen_pairs": {},
     "errors": [],
-    "daily_pnl": 0.0,
-    "daily_pnl_date": "",
-    "sniper_paused_until": 0.0,
-    "recent_losses": {},
     "api_stats": {
         "price_ok": 0, "price_fail": 0,
         "quote_ok": 0, "quote_fail": 0,
@@ -157,22 +150,10 @@ state = {
         "trail_10x": 3.0,
         "trail_20x": 2.0,
         "trail_50x": 1.5,
-        # Tiered profit-take milestones
-        "pt_5x_pct":  25.0,
-        "pt_10x_pct": 25.0,
-        "pt_20x_pct": 25.0,
-        # Risk management
-        "daily_loss_limit_pct": 20.0,
-        "daily_loss_pause_hrs": 4.0,
-        "breakeven_mult": 2.0,
-        "conviction_sizing": True,
-        "max_wallet_concentration": 40.0,
-        # Early dump detection
-        "sell_ratio_flip_threshold": 1.5,
-        "vol_exhaustion_pct": 30.0,
-        # Stale feed alert threshold (consecutive ticks before Telegram alert)
-        "stale_alert_ticks": 120,   # raised: ~60s of real freeze before alerting
-        "stale_alert_cooldown_sec": 300,  # minimum seconds between alerts for same token
+        # Tiered profit-take (% of position to sell at each milestone)
+        "pt_5x_pct":  25.0,   # sell 25% at 5x
+        "pt_10x_pct": 25.0,   # sell 25% at 10x
+        "pt_20x_pct": 25.0,   # sell 25% at 20x
     },
     "ml_features": [], "ml_labels": [],
 }
@@ -198,8 +179,7 @@ async def init_db():
                 entry_price FLOAT, exit_price FLOAT, multiplier FLOAT,
                 net_pnl FLOAT, fees_paid FLOAT, reason TEXT,
                 is_demo BOOLEAN DEFAULT FALSE, tx_sig TEXT,
-                features JSONB, hold_seconds FLOAT DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW());
+                features JSONB, created_at TIMESTAMP DEFAULT NOW());
             CREATE TABLE IF NOT EXISTS ml_data (
                 id SERIAL PRIMARY KEY, features JSONB NOT NULL,
                 label INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW());
@@ -240,14 +220,13 @@ async def db_save_trade(trade):
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO trades(symbol,mint,entry_price,exit_price,multiplier,
-            net_pnl,fees_paid,reason,is_demo,tx_sig,features,hold_seconds)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            net_pnl,fees_paid,reason,is_demo,tx_sig,features)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         """, trade.get("symbol"), trade.get("mint"), trade.get("entry"),
             trade.get("exit"), trade.get("mult"), trade.get("net_pnl"),
             trade.get("fees_paid", 0), trade.get("reason"),
             trade.get("is_demo", False), trade.get("tx_sig"),
-            json.dumps(trade.get("features", [])),
-            trade.get("hold_seconds", 0.0))
+            json.dumps(trade.get("features", [])))
 
 async def db_load_trades():
     async with db_pool.acquire() as conn:
@@ -280,7 +259,7 @@ async def db_load_ml_data():
         rows = await conn.fetch("SELECT features,label FROM ml_data ORDER BY id")
         for r in rows:
             feats = json.loads(r["features"])
-            if len(feats) < 18: feats += [0.0] * (18 - len(feats))
+            if len(feats) < 16: feats += [0.0] * (16 - len(feats))
             state["ml_features"].append(feats)
             state["ml_labels"].append(r["label"])
     log.info(f"ML data loaded: {len(state['ml_features'])} samples")
@@ -336,15 +315,10 @@ def extract_features(td):
         s5m    = float(td.get("txns",{}).get("m5",{}).get("sells",0) or 0)
         mcap   = float(td.get("marketCap",0) or 0)
         age    = (time.time()*1000-(td.get("pairCreatedAt") or time.time()*1000))/60000
-        avg_buy_usd  = (vol5m / b5m) if b5m > 0 else 0
-        avg_sell_usd = (vol5m / s5m) if s5m > 0 else 0
-        buy_size_ratio = avg_buy_usd / (avg_sell_usd + 1)
-        hour_utc = float(datetime.now(timezone.utc).hour)
         return [liq, vol24, pc1, pc6, pc24, b1h, s1h, b1h/(s1h+1),
-                age, mcap, vol5m, b5m, s5m, b5m/(s5m+1), liq/(mcap+1), vol24/(liq+1),
-                buy_size_ratio, hour_utc]
+                age, mcap, vol5m, b5m, s5m, b5m/(s5m+1), liq/(mcap+1), vol24/(liq+1)]
     except Exception as e:
-        log_error("extract_features", e); return [0.0]*18
+        log_error("extract_features", e); return [0.0]*16
 
 def train_model():
     global ml_model, ml_scaler, ml_ready
@@ -367,15 +341,18 @@ def train_model():
 def predict_score(features):
     try:
         if not ml_ready or ml_model is None: return 0.5
-        if len(features) < 18: features = list(features) + [0.0]*(18-len(features))
+        if len(features) < 16: features = list(features) + [0.0]*(16-len(features))
         return float(ml_model.predict_proba(ml_scaler.transform([features]))[0][1])
     except Exception as e:
         log_error("predict_score", e); return 0.5
 
-async def record_trade_outcome(features, is_win, is_demo=False):
-    if state["settings"].get("ml_real_only") and is_demo: return None
-    label = 1 if is_win else 0
-    if len(features) < 18: features = list(features) + [0.0]*(18-len(features))
+async def record_trade_outcome(features, profitable, is_demo=False):
+    # ML real-only mode: skip demo trades from training data
+    if state["settings"].get("ml_real_only") and is_demo:
+        log.info("ML real-only: skipping demo trade")
+        return None
+    label = 1 if profitable else 0
+    if len(features) < 16: features = list(features) + [0.0]*(16-len(features))
     state["ml_features"].append(features)
     state["ml_labels"].append(label)
     await db_save_ml_sample(features, label)
@@ -402,28 +379,6 @@ def calc_fees(amount_usd, priority_lp=20000):
     net = round(0.000005*150.0, 6)
     return {"dex_fee": dex, "priority_fee": pri, "network_fee": net, "total": round(dex+pri+net, 4)}
 
-def _reset_daily_pnl_if_needed():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if state["daily_pnl_date"] != today:
-        state["daily_pnl"] = 0.0; state["daily_pnl_date"] = today
-
-def _check_daily_loss_limit():
-    s = state["settings"]
-    capital   = s.get("trade_amount", 10.0) * s.get("max_real_positions", 3)
-    threshold = -abs(capital * s.get("daily_loss_limit_pct", 20.0) / 100.0)
-    if state["daily_pnl"] <= threshold and time.time() > state.get("sniper_paused_until", 0):
-        pause_secs = s.get("daily_loss_pause_hrs", 4.0) * 3600
-        state["sniper_paused_until"] = time.time() + pause_secs
-    return time.time() < state.get("sniper_paused_until", 0)
-
-def _conviction_amount(ml_score: float) -> float:
-    s = state["settings"]; amt = s["trade_amount"]
-    if not s.get("conviction_sizing", True): return amt
-    if ml_score >= 0.80: return amt
-    if ml_score >= 0.65: return amt * 0.75
-    if ml_score >= 0.50: return amt * 0.50
-    return amt * 0.25
-
 async def _safe_notify(app, text):
     if app is None:
         log.warning(f"_safe_notify called with app=None: {text[:80]}"); return
@@ -432,25 +387,6 @@ async def _safe_notify(app, text):
             parse_mode="Markdown", disable_web_page_preview=True)
     except TelegramError as e:
         log.error(f"Notify failed: {e}")
-
-_stale_last_alert: dict = {}   # mint -> timestamp of last alert sent
-
-async def _stale_feed_alert(mint: str, count: int):
-    cooldown = state["settings"].get("stale_alert_cooldown_sec", 300)
-    last     = _stale_last_alert.get(mint, 0)
-    if time.time() - last < cooldown:
-        return   # suppress — too soon since last alert for this token
-    _stale_last_alert[mint] = time.time()
-    pos    = state["positions"].get(mint) or state["demo_positions"].get(mint)
-    symbol = pos["symbol"] if pos else mint[:8] + "..."
-    mins   = (count * 0.5) / 60
-    if _app_ref:
-        await _safe_notify(_app_ref,
-            f"⚠️ *Stale Price Feed \u2014 {symbol}*\n\n"
-            f"Price frozen ~{mins:.0f} min ({count} consecutive identical ticks).\n"
-            f"Token may be dead or API lagging.\n"
-            f"Consider closing the position manually if needed.")
-
 
 # ============================================================
 # TOKEN DATA & PRICING
@@ -476,31 +412,14 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
 
     now = time.time()
 
-    # 2. Stale-price guard + cache
+    # 2. Return cached price only if it is a real (>0) value and still fresh.
+    #    Failed lookups are cached briefly so we don't hammer APIs on every
+    #    monitor tick, but they expire faster so manual actions retry quickly.
     if mint in _price_cache:
-        ts, cached_val = _price_cache[mint]
-        if cached_val > 0 and now - ts < _PRICE_CACHE_TTL:
-            stale_hist  = getattr(get_token_price, "_stale_hist",  {})
-            stale_count = getattr(get_token_price, "_stale_count", {})
-            hist = stale_hist.get(mint, [])
-            hist.append(cached_val)
-            if len(hist) > 3: hist.pop(0)
-            stale_hist[mint] = hist
-            get_token_price._stale_hist = stale_hist
-            if len(hist) == 3 and len(set(hist)) == 1:
-                count = stale_count.get(mint, 0) + 1
-                stale_count[mint] = count
-                get_token_price._stale_count = stale_count
-                log.warning(f"Stale price feed for {mint[:8]} \u2014 skipping tick ({count} consecutive)")
-                alert_every = state["settings"].get("stale_alert_ticks", 20)
-                if count % alert_every == 0:
-                    asyncio.create_task(_stale_feed_alert(mint, count))
-                return 0.0
-            else:
-                stale_count.pop(mint, None)
-                get_token_price._stale_count = stale_count
-            return cached_val
-        if cached_val == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL:
+        ts, p = _price_cache[mint]
+        if p > 0 and now - ts < _PRICE_CACHE_TTL:
+            return p
+        if p == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL:
             return 0.0
 
     # 3. DexScreener — pick the most-liquid Solana pair
@@ -739,6 +658,10 @@ def kb_tiered_trail():
         [InlineKeyboardButton(f"🟡 ≥10x → {s.get('trail_10x', 3.0)}% trail", callback_data="set_trail_10x")],
         [InlineKeyboardButton(f"🟠 ≥20x → {s.get('trail_20x', 2.0)}% trail", callback_data="set_trail_20x")],
         [InlineKeyboardButton(f"🔴 ≥50x → {s.get('trail_50x', 1.5)}% trail", callback_data="set_trail_50x")],
+        [InlineKeyboardButton("── Profit-Take Milestones ──",                  callback_data="noop")],
+        [InlineKeyboardButton(f"💰 @5x  sell {s.get('pt_5x_pct', 25.0):.0f}%",  callback_data="set_pt_5x")],
+        [InlineKeyboardButton(f"💰 @10x sell {s.get('pt_10x_pct', 25.0):.0f}%", callback_data="set_pt_10x")],
+        [InlineKeyboardButton(f"💰 @20x sell {s.get('pt_20x_pct', 25.0):.0f}%", callback_data="set_pt_20x")],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
     ])
 
@@ -860,6 +783,54 @@ async def _partial_sell_for_capital_recovery(app, mint, pos, current_price, is_d
     pos["fees_paid"]    = 0.0
     pos["capital_recovered"] = True
     return True
+
+# ============================================================
+# TIERED PROFIT-TAKE — sell a slice at 5x / 10x / 20x
+# ============================================================
+async def _tiered_profit_take(app, mint, pos, current_price, milestone: str, is_demo: bool):
+    """Sell `pct`% of remaining tokens at a milestone multiplier (5x/10x/20x)."""
+    s         = state["settings"]
+    pct_key   = f"pt_{milestone}_pct"
+    pct       = s.get(pct_key, 0.0) / 100.0
+    if pct <= 0:
+        return  # milestone disabled
+
+    total_tokens = pos.get("token_amount", 0)
+    if total_tokens <= 0 or current_price <= 0:
+        return
+
+    tokens_to_sell   = int(total_tokens * pct)
+    tokens_remaining = total_tokens - tokens_to_sell
+    usdc_estimate    = tokens_to_sell * current_price
+    pfx = "📝 DEMO " if is_demo else ""
+
+    if is_demo:
+        sell_fee = calc_fees(usdc_estimate)["dex_fee"]
+        usdc_received = usdc_estimate - sell_fee
+    else:
+        result = await execute_sell(mint, tokens_to_sell)
+        if not result:
+            await _safe_notify(app,
+                f"⚠️ *{pfx}Profit-take FAILED at {milestone} for {pos['symbol']}*")
+            return
+        usdc_received = result["usdc_received"]
+        sell_fee      = calc_fees(usdc_received)["dex_fee"]
+
+    pos["token_amount"] = tokens_remaining
+    flag_key = f"pt_{milestone}_done"
+    pos[flag_key] = True
+    await db_save_position(mint, pos, is_demo)
+
+    sig_link = ""
+    if not is_demo and result:
+        sig_link = f"\n🔗 [Solscan](https://solscan.io/tx/{result['signature']})"
+
+    await _safe_notify(app,
+        f"💰 {pfx}*Profit-Take @ {milestone} — {pos['symbol']}*\n{'─'*22}\n"
+        f"├ Sold:       {pct:.0%} of position ({tokens_to_sell:,} tokens)\n"
+        f"├ USDC in:    ${usdc_received:.2f}\n"
+        f"├ Remaining:  {tokens_remaining:,} tokens\n"
+        f"└ Still riding with tiered trail 🚀{sig_link}")
 
 # ============================================================
 # CLOSE POSITION
@@ -1240,6 +1211,12 @@ async def monitor_positions(app):
                     post_tp_trail    = _tiered_trail(peak_mult)
                     trailing_trigger = pos["peak_price"] * (1 - post_tp_trail)
 
+                    # ── Tiered profit-take milestones ──────────────────────────
+                    for milestone, threshold in [("5x", 5.0), ("10x", 10.0), ("20x", 20.0)]:
+                        flag = f"pt_{milestone}_done"
+                        if mult >= threshold and not pos.get(flag):
+                            await _tiered_profit_take(app, mint, pos, price, milestone, is_demo)
+
                     reason = None
                     if mult <= sl:
                         reason = f"🔴 Stop Loss at {mult:.2f}x"
@@ -1292,11 +1269,6 @@ async def monitor_positions(app):
 
                     if reason:
                         price_history.pop(mint, None)
-                        # Clear stale tracking for this mint so no ghost alerts after close
-                        _stale_last_alert.pop(mint, None)
-                        sc = getattr(get_token_price, "_stale_count", {})
-                        sc.pop(mint, None)
-                        get_token_price._stale_count = sc
                         await _close_position(app, mint, pos, price, reason, is_demo)
                 except Exception as e:
                     log_error(f"monitor/{mint[:8]}", e)
@@ -1495,11 +1467,18 @@ async def _button_handler_inner(update, ctx, q, data):
     elif data == "tiered_trail_menu":
         s = state["settings"]
         await q.edit_message_text(
-            f"📐 *Tiered Trailing Stop*\n\nTightens as price pumps higher.\n\n"
+            f"📐 *Tiered Trailing Stop & Profit-Take*\n\n"
+            f"*Trailing Stop* — tightens as price pumps:\n"
             f"├ Peak ≥ 5x  → {s.get('trail_5x',4.0)}% trail\n"
             f"├ Peak ≥ 10x → {s.get('trail_10x',3.0)}% trail\n"
             f"├ Peak ≥ 20x → {s.get('trail_20x',2.0)}% trail\n"
-            f"└ Peak ≥ 50x → {s.get('trail_50x',1.5)}% trail\n\n_(Below 5x: default 5%)_",
+            f"└ Peak ≥ 50x → {s.get('trail_50x',1.5)}% trail\n"
+            f"_(Below 5x: default 5%)_\n\n"
+            f"*Profit-Take* — auto-sell a slice at each milestone:\n"
+            f"├ @ 5x  → sell {s.get('pt_5x_pct',25.0):.0f}% of position\n"
+            f"├ @ 10x → sell {s.get('pt_10x_pct',25.0):.0f}% of position\n"
+            f"└ @ 20x → sell {s.get('pt_20x_pct',25.0):.0f}% of position\n"
+            f"_(Set any to 0 to disable that milestone)_",
             parse_mode="Markdown", reply_markup=kb_tiered_trail())
 
     elif data == "set_trail_5x":
@@ -1521,6 +1500,30 @@ async def _button_handler_inner(update, ctx, q, data):
         ctx.user_data["setting"] = "trail_50x"
         await q.edit_message_text(f"🔴 *Trail % at ≥50x*\nCurrent: {state['settings'].get('trail_50x',1.5)}%\n\nSend a percentage:\n_Recommended: 1–2%_",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_TRAIL_50X
+
+    elif data == "set_pt_5x":
+        ctx.user_data["setting"] = "pt_5x_pct"
+        await q.edit_message_text(
+            f"💰 *Profit-Take @ 5x*\nCurrent: {state['settings'].get('pt_5x_pct',25.0):.0f}%\n\n"
+            f"Sell this % of your position when price hits 5x.\nSet to 0 to disable.\n_Recommended: 20–33%_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PT_5X
+
+    elif data == "set_pt_10x":
+        ctx.user_data["setting"] = "pt_10x_pct"
+        await q.edit_message_text(
+            f"💰 *Profit-Take @ 10x*\nCurrent: {state['settings'].get('pt_10x_pct',25.0):.0f}%\n\n"
+            f"Sell this % of your position when price hits 10x.\nSet to 0 to disable.\n_Recommended: 20–33%_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PT_10X
+
+    elif data == "set_pt_20x":
+        ctx.user_data["setting"] = "pt_20x_pct"
+        await q.edit_message_text(
+            f"💰 *Profit-Take @ 20x*\nCurrent: {state['settings'].get('pt_20x_pct',25.0):.0f}%\n\n"
+            f"Sell this % of your position when price hits 20x.\nSet to 0 to disable.\n_Recommended: 15–25%_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PT_20X
+
+    elif data == "noop":
+        pass  # separator button — do nothing
 
     elif data == "buy_prompt":
         ctx.user_data["action"] = "buy"
@@ -1741,8 +1744,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ============================================================
 async def post_init(app):
-    global _app_ref
-    _app_ref = app
     await init_db(); await load_all_from_db()
     asyncio.create_task(monitor_positions(app))
     asyncio.create_task(auto_sniper_loop(app))
@@ -1779,12 +1780,10 @@ def main():
             WAITING_SET_MIN_AGE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_VOL5M:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_DEMO:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
-            WAITING_SET_MAX_REAL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
-            WAITING_SET_PT_5X:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
-            WAITING_SET_PT_10X:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
-            WAITING_SET_PT_20X:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
-            WAITING_SET_DAILY_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
-            WAITING_SET_BE_MULT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MAX_REAL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PT_5X:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PT_10X:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PT_20X:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
