@@ -171,7 +171,8 @@ state = {
         "sell_ratio_flip_threshold": 1.5,
         "vol_exhaustion_pct": 30.0,
         # Stale feed alert threshold (consecutive ticks before Telegram alert)
-        "stale_alert_ticks": 20,
+        "stale_alert_ticks": 120,   # raised: ~60s of real freeze before alerting
+        "stale_alert_cooldown_sec": 300,  # minimum seconds between alerts for same token
     },
     "ml_features": [], "ml_labels": [],
 }
@@ -432,7 +433,14 @@ async def _safe_notify(app, text):
     except TelegramError as e:
         log.error(f"Notify failed: {e}")
 
+_stale_last_alert: dict = {}   # mint -> timestamp of last alert sent
+
 async def _stale_feed_alert(mint: str, count: int):
+    cooldown = state["settings"].get("stale_alert_cooldown_sec", 300)
+    last     = _stale_last_alert.get(mint, 0)
+    if time.time() - last < cooldown:
+        return   # suppress — too soon since last alert for this token
+    _stale_last_alert[mint] = time.time()
     pos    = state["positions"].get(mint) or state["demo_positions"].get(mint)
     symbol = pos["symbol"] if pos else mint[:8] + "..."
     mins   = (count * 0.5) / 60
@@ -1284,6 +1292,11 @@ async def monitor_positions(app):
 
                     if reason:
                         price_history.pop(mint, None)
+                        # Clear stale tracking for this mint so no ghost alerts after close
+                        _stale_last_alert.pop(mint, None)
+                        sc = getattr(get_token_price, "_stale_count", {})
+                        sc.pop(mint, None)
+                        get_token_price._stale_count = sc
                         await _close_position(app, mint, pos, price, reason, is_demo)
                 except Exception as e:
                     log_error(f"monitor/{mint[:8]}", e)
