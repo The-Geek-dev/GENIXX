@@ -86,6 +86,9 @@ WAITING_SET_MIN_AGE   = 24
 WAITING_SET_VOL5M     = 25
 WAITING_SET_MAX_DEMO  = 26
 WAITING_SET_MAX_REAL  = 27
+WAITING_SET_PT_5X     = 30
+WAITING_SET_PT_10X    = 31
+WAITING_SET_PT_20X    = 32
 
 def validate_config():
     missing = [k for k, v in {
@@ -147,6 +150,10 @@ state = {
         "trail_10x": 3.0,
         "trail_20x": 2.0,
         "trail_50x": 1.5,
+        # Tiered profit-take (% of position to sell at each milestone)
+        "pt_5x_pct":  25.0,   # sell 25% at 5x
+        "pt_10x_pct": 25.0,   # sell 25% at 10x
+        "pt_20x_pct": 25.0,   # sell 25% at 20x
     },
     "ml_features": [], "ml_labels": [],
 }
@@ -385,12 +392,14 @@ async def _safe_notify(app, text):
 # TOKEN DATA & PRICING
 # ============================================================
 _price_cache: dict = {}       # mint -> (timestamp, price)
-_PRICE_CACHE_TTL   = 1.5      # seconds — avoids duplicate API hits per monitor cycle
+_PRICE_CACHE_TTL      = 8.0   # seconds — reuse fresh prices across monitor cycles
+_PRICE_CACHE_FAIL_TTL = 3.0   # seconds — retry failed mints sooner than successes
 
 _rugcheck_cache: dict = {}    # mint -> (timestamp, result)
 _RUGCHECK_CACHE_TTL   = 300   # 5 minutes
 
 async def get_token_price(mint: str, pair_data: dict = None) -> float:
+    # 1. Use inline pair data if supplied (fastest — no network call)
     if pair_data:
         try:
             price = float(pair_data.get("priceUsd", 0) or 0)
@@ -398,53 +407,104 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                 state["api_stats"]["price_ok"] += 1
                 _price_cache[mint] = (time.time(), price)
                 return price
-        except Exception: pass
+        except Exception:
+            pass
 
     now = time.time()
+
+    # 2. Return cached price only if it is a real (>0) value and still fresh.
+    #    Failed lookups are cached briefly so we don't hammer APIs on every
+    #    monitor tick, but they expire faster so manual actions retry quickly.
     if mint in _price_cache:
         ts, p = _price_cache[mint]
-        if now - ts < _PRICE_CACHE_TTL: return p
+        if p > 0 and now - ts < _PRICE_CACHE_TTL:
+            return p
+        if p == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL:
+            return 0.0
 
-    # DexScreener
+    # 3. DexScreener — pick the most-liquid Solana pair
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
             async with s.get(f"{DEXSCREENER_API}{mint}") as r:
                 if r.status == 200:
-                    pairs = [p for p in ((await r.json()).get("pairs") or []) if p.get("chainId")=="solana"]
+                    pairs = [p for p in ((await r.json()).get("pairs") or [])
+                             if p.get("chainId") == "solana"]
                     if pairs:
+                        # Sort by liquidity — the most liquid pair has the most reliable price
+                        pairs.sort(
+                            key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0),
+                            reverse=True,
+                        )
                         price = float(pairs[0].get("priceUsd", 0) or 0)
                         if price > 0:
                             state["api_stats"]["price_ok"] += 1
-                            _price_cache[mint] = (now, price); return price
-    except Exception as e: log.warning(f"DexScreener price: {e}")
+                            _price_cache[mint] = (now, price)
+                            return price
+                elif r.status == 429:
+                    log.warning("DexScreener rate-limited, skipping to next source")
+    except Exception as e:
+        log.warning(f"DexScreener price: {e}")
 
-    # Birdeye
+    # 4. Jupiter Price API v2 — price can be returned as a string, handle both
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
-            async with s.get(f"https://public-api.birdeye.so/defi/price?address={mint}",
-                             headers={"X-Chain": "solana"}) as r:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+            async with s.get(f"{JUPITER_PRICE_API}?ids={mint}&showExtraInfo=false") as r:
                 if r.status == 200:
-                    price = float((await r.json()).get("data",{}).get("value",0) or 0)
+                    raw = (await r.json()).get("data", {}).get(mint, {})
+                    price = float(raw.get("price") or 0)
                     if price > 0:
                         state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, price); return price
-    except Exception as e: log.warning(f"Birdeye price: {e}")
+                        _price_cache[mint] = (now, price)
+                        return price
+    except Exception as e:
+        log.warning(f"Jupiter price API: {e}")
 
-    # Jupiter
+    # 5. Jupiter Quote fallback — derive price from a tiny 1-USDC → token quote
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as s:
-            async with s.get(f"{JUPITER_PRICE_API}?ids={mint}") as r:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
+            async with s.get(
+                JUPITER_QUOTE_API,
+                params={
+                    "inputMint": USDC_MINT,
+                    "outputMint": mint,
+                    "amount": 1_000_000,   # 1 USDC (6 decimals)
+                    "slippageBps": 500,
+                },
+            ) as r:
                 if r.status == 200:
-                    price = float((await r.json()).get("data",{}).get(mint,{}).get("price",0) or 0)
+                    q = await r.json()
+                    out = int(q.get("outAmount", 0))
+                    decimals = int(q.get("outputDecimals", 6))
+                    if out > 0:
+                        price = 1.0 / (out / (10 ** decimals))
+                        state["api_stats"]["price_ok"] += 1
+                        _price_cache[mint] = (now, price)
+                        log.info(f"Price via Jupiter quote fallback: {mint[:8]} = ${price:.8f}")
+                        return price
+    except Exception as e:
+        log.warning(f"Jupiter quote fallback price: {e}")
+
+    # 6. GeckoTerminal fallback
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+            url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}"
+            async with s.get(url, headers={"Accept": "application/json"}) as r:
+                if r.status == 200:
+                    price = float(
+                        (await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0
+                    )
                     if price > 0:
                         state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, price); return price
-    except Exception as e: log.warning(f"Jupiter price: {e}")
+                        _price_cache[mint] = (now, price)
+                        log.info(f"Price via GeckoTerminal: {mint[:8]} = ${price:.8f}")
+                        return price
+    except Exception as e:
+        log.warning(f"GeckoTerminal price: {e}")
 
     state["api_stats"]["price_fail"] += 1
-    _price_cache[mint] = (now, 0.0)  # cache failure briefly
+    _price_cache[mint] = (now, 0.0)
+    log.warning(f"All price sources failed for {mint[:16]}")
     return 0.0
-
 async def get_token_data(mint):
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
@@ -598,6 +658,10 @@ def kb_tiered_trail():
         [InlineKeyboardButton(f"🟡 ≥10x → {s.get('trail_10x', 3.0)}% trail", callback_data="set_trail_10x")],
         [InlineKeyboardButton(f"🟠 ≥20x → {s.get('trail_20x', 2.0)}% trail", callback_data="set_trail_20x")],
         [InlineKeyboardButton(f"🔴 ≥50x → {s.get('trail_50x', 1.5)}% trail", callback_data="set_trail_50x")],
+        [InlineKeyboardButton("── Profit-Take Milestones ──",                  callback_data="noop")],
+        [InlineKeyboardButton(f"💰 @5x  sell {s.get('pt_5x_pct', 25.0):.0f}%",  callback_data="set_pt_5x")],
+        [InlineKeyboardButton(f"💰 @10x sell {s.get('pt_10x_pct', 25.0):.0f}%", callback_data="set_pt_10x")],
+        [InlineKeyboardButton(f"💰 @20x sell {s.get('pt_20x_pct', 25.0):.0f}%", callback_data="set_pt_20x")],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
     ])
 
@@ -719,6 +783,54 @@ async def _partial_sell_for_capital_recovery(app, mint, pos, current_price, is_d
     pos["fees_paid"]    = 0.0
     pos["capital_recovered"] = True
     return True
+
+# ============================================================
+# TIERED PROFIT-TAKE — sell a slice at 5x / 10x / 20x
+# ============================================================
+async def _tiered_profit_take(app, mint, pos, current_price, milestone: str, is_demo: bool):
+    """Sell `pct`% of remaining tokens at a milestone multiplier (5x/10x/20x)."""
+    s         = state["settings"]
+    pct_key   = f"pt_{milestone}_pct"
+    pct       = s.get(pct_key, 0.0) / 100.0
+    if pct <= 0:
+        return  # milestone disabled
+
+    total_tokens = pos.get("token_amount", 0)
+    if total_tokens <= 0 or current_price <= 0:
+        return
+
+    tokens_to_sell   = int(total_tokens * pct)
+    tokens_remaining = total_tokens - tokens_to_sell
+    usdc_estimate    = tokens_to_sell * current_price
+    pfx = "📝 DEMO " if is_demo else ""
+
+    if is_demo:
+        sell_fee = calc_fees(usdc_estimate)["dex_fee"]
+        usdc_received = usdc_estimate - sell_fee
+    else:
+        result = await execute_sell(mint, tokens_to_sell)
+        if not result:
+            await _safe_notify(app,
+                f"⚠️ *{pfx}Profit-take FAILED at {milestone} for {pos['symbol']}*")
+            return
+        usdc_received = result["usdc_received"]
+        sell_fee      = calc_fees(usdc_received)["dex_fee"]
+
+    pos["token_amount"] = tokens_remaining
+    flag_key = f"pt_{milestone}_done"
+    pos[flag_key] = True
+    await db_save_position(mint, pos, is_demo)
+
+    sig_link = ""
+    if not is_demo and result:
+        sig_link = f"\n🔗 [Solscan](https://solscan.io/tx/{result['signature']})"
+
+    await _safe_notify(app,
+        f"💰 {pfx}*Profit-Take @ {milestone} — {pos['symbol']}*\n{'─'*22}\n"
+        f"├ Sold:       {pct:.0%} of position ({tokens_to_sell:,} tokens)\n"
+        f"├ USDC in:    ${usdc_received:.2f}\n"
+        f"├ Remaining:  {tokens_remaining:,} tokens\n"
+        f"└ Still riding with tiered trail 🚀{sig_link}")
 
 # ============================================================
 # CLOSE POSITION
@@ -1099,10 +1211,33 @@ async def monitor_positions(app):
                     post_tp_trail    = _tiered_trail(peak_mult)
                     trailing_trigger = pos["peak_price"] * (1 - post_tp_trail)
 
+                    # ── Tiered profit-take milestones ──────────────────────────
+                    for milestone, threshold in [("5x", 5.0), ("10x", 10.0), ("20x", 20.0)]:
+                        flag = f"pt_{milestone}_done"
+                        if mult >= threshold and not pos.get(flag):
+                            await _tiered_profit_take(app, mint, pos, price, milestone, is_demo)
+
                     reason = None
                     if mult <= sl:
                         reason = f"🔴 Stop Loss at {mult:.2f}x"
                     elif pos.get("tp_hit"):
+                        # ── House Money guard ──────────────────────────────────────────
+                        # If house money mode is ON and capital hasn't been recovered yet,
+                        # attempt the partial sell NOW (in case it failed or was missed on
+                        # the TP tick) and skip closing this tick so the trail can run on
+                        # pure-profit tokens.
+                        if (state["settings"].get("house_money_mode")
+                                and not pos.get("capital_recovered")):
+                            log.info(f"House money recovery pending for {pos['symbol']} — attempting before trail exit")
+                            ok = await _partial_sell_for_capital_recovery(app, mint, pos, price, is_demo)
+                            await db_save_position(mint, pos, is_demo)
+                            if not ok:
+                                # Recovery failed (e.g. real sell failed) — let trail/momentum run normally
+                                log.warning(f"House money recovery failed for {pos['symbol']} — allowing exit")
+                            else:
+                                # Capital secured — skip close this tick, let trail do its job
+                                continue
+
                         hist = price_history.get(mint, [])
                         momentum_exit = False
                         if len(hist) >= 5:
@@ -1157,6 +1292,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
 async def _button_handler_inner(update, ctx, q, data):
+    app = ctx.application  # needed by _close_position calls throughout this handler
     if data == "main_menu":
         await q.edit_message_text(await build_dashboard(), parse_mode="Markdown", reply_markup=kb_main())
 
@@ -1331,11 +1467,18 @@ async def _button_handler_inner(update, ctx, q, data):
     elif data == "tiered_trail_menu":
         s = state["settings"]
         await q.edit_message_text(
-            f"📐 *Tiered Trailing Stop*\n\nTightens as price pumps higher.\n\n"
+            f"📐 *Tiered Trailing Stop & Profit-Take*\n\n"
+            f"*Trailing Stop* — tightens as price pumps:\n"
             f"├ Peak ≥ 5x  → {s.get('trail_5x',4.0)}% trail\n"
             f"├ Peak ≥ 10x → {s.get('trail_10x',3.0)}% trail\n"
             f"├ Peak ≥ 20x → {s.get('trail_20x',2.0)}% trail\n"
-            f"└ Peak ≥ 50x → {s.get('trail_50x',1.5)}% trail\n\n_(Below 5x: default 5%)_",
+            f"└ Peak ≥ 50x → {s.get('trail_50x',1.5)}% trail\n"
+            f"_(Below 5x: default 5%)_\n\n"
+            f"*Profit-Take* — auto-sell a slice at each milestone:\n"
+            f"├ @ 5x  → sell {s.get('pt_5x_pct',25.0):.0f}% of position\n"
+            f"├ @ 10x → sell {s.get('pt_10x_pct',25.0):.0f}% of position\n"
+            f"└ @ 20x → sell {s.get('pt_20x_pct',25.0):.0f}% of position\n"
+            f"_(Set any to 0 to disable that milestone)_",
             parse_mode="Markdown", reply_markup=kb_tiered_trail())
 
     elif data == "set_trail_5x":
@@ -1357,6 +1500,30 @@ async def _button_handler_inner(update, ctx, q, data):
         ctx.user_data["setting"] = "trail_50x"
         await q.edit_message_text(f"🔴 *Trail % at ≥50x*\nCurrent: {state['settings'].get('trail_50x',1.5)}%\n\nSend a percentage:\n_Recommended: 1–2%_",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_TRAIL_50X
+
+    elif data == "set_pt_5x":
+        ctx.user_data["setting"] = "pt_5x_pct"
+        await q.edit_message_text(
+            f"💰 *Profit-Take @ 5x*\nCurrent: {state['settings'].get('pt_5x_pct',25.0):.0f}%\n\n"
+            f"Sell this % of your position when price hits 5x.\nSet to 0 to disable.\n_Recommended: 20–33%_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PT_5X
+
+    elif data == "set_pt_10x":
+        ctx.user_data["setting"] = "pt_10x_pct"
+        await q.edit_message_text(
+            f"💰 *Profit-Take @ 10x*\nCurrent: {state['settings'].get('pt_10x_pct',25.0):.0f}%\n\n"
+            f"Sell this % of your position when price hits 10x.\nSet to 0 to disable.\n_Recommended: 20–33%_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PT_10X
+
+    elif data == "set_pt_20x":
+        ctx.user_data["setting"] = "pt_20x_pct"
+        await q.edit_message_text(
+            f"💰 *Profit-Take @ 20x*\nCurrent: {state['settings'].get('pt_20x_pct',25.0):.0f}%\n\n"
+            f"Sell this % of your position when price hits 20x.\nSet to 0 to disable.\n_Recommended: 15–25%_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PT_20X
+
+    elif data == "noop":
+        pass  # separator button — do nothing
 
     elif data == "buy_prompt":
         ctx.user_data["action"] = "buy"
@@ -1536,8 +1703,9 @@ async def handle_confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fees    = calc_fees(amt)
     await q.edit_message_text(f"⏳ {'[DEMO] ' if is_demo else ''}Buying {symbol}...", parse_mode="Markdown")
     price = await get_token_price(mint)
-    if price <= 0:
-        await q.edit_message_text("❌ Price unavailable. Try again.", reply_markup=kb_main())
+    if price <= 0 and is_demo:
+        # Demo trades need a real entry price; real trades proceed via Jupiter quote
+        await q.edit_message_text("❌ Price unavailable for demo trade. Try again.", reply_markup=kb_main())
         return ConversationHandler.END
     if is_demo:
         td  = await get_token_data(mint)
@@ -1613,6 +1781,9 @@ def main():
             WAITING_SET_VOL5M:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_DEMO:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_REAL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PT_5X:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PT_10X:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PT_20X:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
