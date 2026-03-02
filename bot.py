@@ -10,7 +10,7 @@ import joblib
 import base58
 import asyncpg
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -64,6 +64,7 @@ RUGCHECK_API      = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
 RUGCHECK_SCORE_MIN = int(os.getenv("RUGCHECK_SCORE_MIN", "500"))
 HELIUS_RPC        = os.getenv("HELIUS_RPC", "")
 USDC_MINT         = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+RAYDIUM_PROGRAM   = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
 # Conversation states
 WAITING_BUY_MINT      = 0
@@ -89,6 +90,9 @@ WAITING_SET_MAX_REAL  = 27
 WAITING_SET_PT_5X     = 30
 WAITING_SET_PT_10X    = 31
 WAITING_SET_PT_20X    = 32
+WAITING_SET_DAILY_LOSS = 33
+WAITING_SET_CONV_SIZE  = 34
+WAITING_SET_BE_MULT    = 35
 
 def validate_config():
     missing = [k for k, v in {
@@ -111,6 +115,10 @@ state = {
     "total_pnl": 0.0, "trades_history": [],
     "seen_pairs": {},
     "errors": [],
+    "daily_pnl": 0.0,           # resets at midnight UTC
+    "daily_pnl_date": "",       # YYYY-MM-DD of last reset
+    "sniper_paused_until": 0.0, # epoch — auto-pause after daily loss limit
+    "recent_losses": {},        # mint -> epoch; blocks revenge re-entry
     "api_stats": {
         "price_ok": 0, "price_fail": 0,
         "quote_ok": 0, "quote_fail": 0,
@@ -119,9 +127,9 @@ state = {
     },
     "settings": {
         # Core trading
-        "take_profit": 3.0,          # raised: let it run before recovering capital
+        "take_profit": 3.0,
         "trailing_stop": 15,
-        "stop_loss": 0.5,            # tightened: cut losses fast on meme coins
+        "stop_loss": 0.5,
         "trade_amount": 10.0,
         "demo_trade_amount": 100.0,
         "slippage_bps": 100,
@@ -130,18 +138,19 @@ state = {
         "auto_snipe": False,
         "demo_mode": False,
         "house_money_mode": True,
-        "ml_real_only": False,       # when True, ML trains only on real trades
+        "ml_real_only": False,
         # Filters
-        "min_liquidity": 50000,      # raised: low liq = likely rug
-        "min_score": 0.5,            # raised: only buy when ML ≥50% confident
+        "min_liquidity": 50000,
+        "min_score": 0.5,
         "min_rugcheck": 500,
-        "min_token_age_sec": 120,    # skip tokens <2min old (no price data yet)
-        "min_vol5m_pct": 10.0,       # 5m volume must be ≥10% of liquidity
+        "min_token_age_sec": 120,
+        "min_vol5m_pct": 10.0,
+        "max_wallet_concentration": 40.0,  # skip if top-10 wallets hold >40% supply
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
         # Timing
-        "seen_expiry_sec": 7200,     # 2h before re-evaluating a seen token
+        "seen_expiry_sec": 7200,
         "max_retries": 3,
         "retry_delay": 1.5,
         "confirm_timeout": 45,
@@ -151,9 +160,17 @@ state = {
         "trail_20x": 2.0,
         "trail_50x": 1.5,
         # Tiered profit-take (% of position to sell at each milestone)
-        "pt_5x_pct":  25.0,   # sell 25% at 5x
-        "pt_10x_pct": 25.0,   # sell 25% at 10x
-        "pt_20x_pct": 25.0,   # sell 25% at 20x
+        "pt_5x_pct":  25.0,
+        "pt_10x_pct": 25.0,
+        "pt_20x_pct": 25.0,
+        # Risk management
+        "daily_loss_limit_pct": 20.0,   # pause sniper if daily loss > X% of capital
+        "daily_loss_pause_hrs": 4.0,    # hours to pause after daily loss limit hit
+        "breakeven_mult": 2.0,          # move stop to entry once price hits this mult
+        "conviction_sizing": True,       # scale trade size by ML score
+        # Early dump detection
+        "sell_ratio_flip_threshold": 1.5,  # sells > buys * this => early exit
+        "vol_exhaustion_pct": 30.0,        # exit if 5m vol < X% of peak vol (post-TP)
     },
     "ml_features": [], "ml_labels": [],
 }
@@ -179,7 +196,8 @@ async def init_db():
                 entry_price FLOAT, exit_price FLOAT, multiplier FLOAT,
                 net_pnl FLOAT, fees_paid FLOAT, reason TEXT,
                 is_demo BOOLEAN DEFAULT FALSE, tx_sig TEXT,
-                features JSONB, created_at TIMESTAMP DEFAULT NOW());
+                features JSONB, hold_seconds FLOAT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW());
             CREATE TABLE IF NOT EXISTS ml_data (
                 id SERIAL PRIMARY KEY, features JSONB NOT NULL,
                 label INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW());
@@ -220,13 +238,14 @@ async def db_save_trade(trade):
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO trades(symbol,mint,entry_price,exit_price,multiplier,
-            net_pnl,fees_paid,reason,is_demo,tx_sig,features)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            net_pnl,fees_paid,reason,is_demo,tx_sig,features,hold_seconds)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         """, trade.get("symbol"), trade.get("mint"), trade.get("entry"),
             trade.get("exit"), trade.get("mult"), trade.get("net_pnl"),
             trade.get("fees_paid", 0), trade.get("reason"),
             trade.get("is_demo", False), trade.get("tx_sig"),
-            json.dumps(trade.get("features", [])))
+            json.dumps(trade.get("features", [])),
+            trade.get("hold_seconds", 0.0))
 
 async def db_load_trades():
     async with db_pool.acquire() as conn:
@@ -238,13 +257,15 @@ async def db_load_trades():
                 state["demo_trades"].append({
                     "symbol": t["symbol"], "mult": t["multiplier"],
                     "net_pnl": t["net_pnl"], "reason": t["reason"],
+                    "hold_seconds": t.get("hold_seconds", 0),
                     "projected_real": t["net_pnl"] * (
                         state["settings"]["trade_amount"] / state["settings"]["demo_trade_amount"])
                 })
             else:
                 state["trades_history"].append({
                     "symbol": t["symbol"], "mult": t["multiplier"],
-                    "net_pnl": t["net_pnl"], "reason": t["reason"]})
+                    "net_pnl": t["net_pnl"], "reason": t["reason"],
+                    "hold_seconds": t.get("hold_seconds", 0)})
         for r in await conn.fetch("SELECT SUM(net_pnl) as total,is_demo FROM trades GROUP BY is_demo"):
             if r["is_demo"]: state["demo_total_pnl"] = float(r["total"] or 0)
             else:            state["total_pnl"]       = float(r["total"] or 0)
@@ -259,7 +280,7 @@ async def db_load_ml_data():
         rows = await conn.fetch("SELECT features,label FROM ml_data ORDER BY id")
         for r in rows:
             feats = json.loads(r["features"])
-            if len(feats) < 16: feats += [0.0] * (16 - len(feats))
+            if len(feats) < 18: feats += [0.0] * (18 - len(feats))
             state["ml_features"].append(feats)
             state["ml_labels"].append(r["label"])
     log.info(f"ML data loaded: {len(state['ml_features'])} samples")
@@ -302,6 +323,7 @@ async def with_retry(fn, retries=3, delay=1.5, label=""):
 ml_model = None; ml_scaler = StandardScaler(); ml_ready = False
 
 def extract_features(td):
+    """16 market features + hour-of-day + buy-size anomaly = 18 features."""
     try:
         liq    = float(td.get("liquidity",{}).get("usd",0) or 0)
         vol24  = float(td.get("volume",{}).get("h24",0) or 0)
@@ -315,10 +337,17 @@ def extract_features(td):
         s5m    = float(td.get("txns",{}).get("m5",{}).get("sells",0) or 0)
         mcap   = float(td.get("marketCap",0) or 0)
         age    = (time.time()*1000-(td.get("pairCreatedAt") or time.time()*1000))/60000
+        # avg buy size vs avg sell size (wash-trade signal)
+        avg_buy_usd  = (vol5m / b5m) if b5m > 0 else 0
+        avg_sell_usd = (vol5m / s5m) if s5m > 0 else 0
+        buy_size_ratio = avg_buy_usd / (avg_sell_usd + 1)
+        # hour of day (UTC) — pump timing feature
+        hour_utc = datetime.now(timezone.utc).hour
         return [liq, vol24, pc1, pc6, pc24, b1h, s1h, b1h/(s1h+1),
-                age, mcap, vol5m, b5m, s5m, b5m/(s5m+1), liq/(mcap+1), vol24/(liq+1)]
+                age, mcap, vol5m, b5m, s5m, b5m/(s5m+1), liq/(mcap+1), vol24/(liq+1),
+                buy_size_ratio, float(hour_utc)]
     except Exception as e:
-        log_error("extract_features", e); return [0.0]*16
+        log_error("extract_features", e); return [0.0]*18
 
 def train_model():
     global ml_model, ml_scaler, ml_ready
@@ -327,150 +356,139 @@ def train_model():
         X, y = np.array(state["ml_features"]), np.array(state["ml_labels"])
         if len(X) < 10: return None
         ml_scaler = StandardScaler(); Xs = ml_scaler.fit_transform(X)
-        ml_model = RandomForestClassifier(n_estimators=100, max_depth=6,
-            min_samples_leaf=2, random_state=42, class_weight="balanced")
+        ml_model  = RandomForestClassifier(n_estimators=100, random_state=42,
+                        class_weight="balanced")
         ml_model.fit(Xs, y); ml_ready = True
         preds = ml_model.predict(Xs)
-        precision = precision_score(y, preds, zero_division=0)
-        recall    = recall_score(y, preds, zero_division=0)
-        log.info(f"ML trained: {len(X)} samples | precision={precision:.0%} recall={recall:.0%}")
-        return precision
+        prec  = precision_score(y, preds, zero_division=0)
+        rec   = recall_score(y, preds, zero_division=0)
+        log.info(f"ML trained: {len(X)} samples | precision={prec:.2f} recall={rec:.2f}")
+        return prec
     except Exception as e:
         log_error("train_model", e); return None
 
 def predict_score(features):
+    if not ml_ready or ml_model is None: return 0.5
     try:
-        if not ml_ready or ml_model is None: return 0.5
-        if len(features) < 16: features = list(features) + [0.0]*(16-len(features))
-        return float(ml_model.predict_proba(ml_scaler.transform([features]))[0][1])
-    except Exception as e:
-        log_error("predict_score", e); return 0.5
+        f = features[:]
+        if len(f) < 18: f += [0.0]*(18-len(f))
+        Xs = ml_scaler.transform([f])
+        return float(ml_model.predict_proba(Xs)[0][1])
+    except Exception: return 0.5
 
-async def record_trade_outcome(features, profitable, is_demo=False):
-    # ML real-only mode: skip demo trades from training data
-    if state["settings"].get("ml_real_only") and is_demo:
-        log.info("ML real-only: skipping demo trade")
-        return None
-    label = 1 if profitable else 0
-    if len(features) < 16: features = list(features) + [0.0]*(16-len(features))
-    state["ml_features"].append(features)
-    state["ml_labels"].append(label)
-    await db_save_ml_sample(features, label)
-    return train_model()
-
-# ============================================================
-# AUTH & UTILITIES
-# ============================================================
-def auth(func):
-    async def wrapper(update, ctx):
-        uid = (update.effective_user.id if update.effective_user else None)
-        if uid != AUTHORIZED_USER:
-            await (update.message or update.callback_query.message).reply_text("Unauthorized.")
-            return
-        try: return await func(update, ctx)
-        except Exception as e:
-            log_error(f"cmd/{func.__name__}", e)
-            msg = update.message or (update.callback_query.message if update.callback_query else None)
-            if msg: await msg.reply_text(f"Error: `{type(e).__name__}: {str(e)[:100]}`", parse_mode="Markdown")
-    return wrapper
-
-def calc_fees(amount_usd, priority_lp=20000):
-    dex = round(amount_usd*0.003, 4); pri = round((priority_lp/1e9)*150.0, 4)
-    net = round(0.000005*150.0, 6)
-    return {"dex_fee": dex, "priority_fee": pri, "network_fee": net, "total": round(dex+pri+net, 4)}
-
-async def _safe_notify(app, text):
-    if app is None:
-        log.warning(f"_safe_notify called with app=None: {text[:80]}"); return
-    try:
-        await app.bot.send_message(chat_id=AUTHORIZED_USER, text=text,
-            parse_mode="Markdown", disable_web_page_preview=True)
-    except TelegramError as e:
-        log.error(f"Notify failed: {e}")
+async def record_trade_outcome(features, is_win, is_demo=False):
+    s = state["settings"]
+    if s.get("ml_real_only") and is_demo: return None
+    label = 1 if is_win else 0
+    f = features[:]
+    if len(f) < 18: f += [0.0]*(18-len(f))
+    state["ml_features"].append(f); state["ml_labels"].append(label)
+    await db_save_ml_sample(f, label)
+    if len(state["ml_features"]) >= 10: return train_model()
+    return None
 
 # ============================================================
-# TOKEN DATA & PRICING
+# FEES
 # ============================================================
-_price_cache: dict = {}       # mint -> (timestamp, price)
-_PRICE_CACHE_TTL      = 8.0   # seconds — reuse fresh prices across monitor cycles
-_PRICE_CACHE_FAIL_TTL = 3.0   # seconds — retry failed mints sooner than successes
+def calc_fees(amount_usd):
+    dex   = amount_usd * 0.003
+    gas   = 0.002
+    total = dex + gas
+    return {"dex_fee": dex, "gas_fee": gas, "total": total}
 
-_rugcheck_cache: dict = {}    # mint -> (timestamp, result)
-_RUGCHECK_CACHE_TTL   = 300   # 5 minutes
+# ============================================================
+# DAILY P&L TRACKER
+# ============================================================
+def _reset_daily_pnl_if_needed():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state["daily_pnl_date"] != today:
+        state["daily_pnl"]      = 0.0
+        state["daily_pnl_date"] = today
+        log.info(f"Daily P&L reset for {today}")
 
-async def get_token_price(mint: str, pair_data: dict = None) -> float:
-    # 1. Use inline pair data if supplied (fastest — no network call)
-    if pair_data:
-        try:
-            price = float(pair_data.get("priceUsd", 0) or 0)
-            if price > 0:
-                state["api_stats"]["price_ok"] += 1
-                _price_cache[mint] = (time.time(), price)
-                return price
-        except Exception:
-            pass
+def _check_daily_loss_limit(app_ref=None):
+    """Returns True if sniper should be paused."""
+    s = state["settings"]
+    limit_pct  = s.get("daily_loss_limit_pct", 20.0)
+    capital    = s.get("trade_amount", 10.0) * s.get("max_real_positions", 3)
+    threshold  = -abs(capital * limit_pct / 100.0)
+    if state["daily_pnl"] <= threshold and time.time() > state.get("sniper_paused_until", 0):
+        pause_secs = s.get("daily_loss_pause_hrs", 4.0) * 3600
+        state["sniper_paused_until"] = time.time() + pause_secs
+        log.warning(f"Daily loss limit hit (${state['daily_pnl']:.2f}). Sniper paused {pause_secs/3600:.1f}h.")
+        return True
+    return time.time() < state.get("sniper_paused_until", 0)
 
+# ============================================================
+# PRICE / DATA APIs
+# ============================================================
+_price_cache: dict = {}
+_PRICE_CACHE_TTL   = 3
+_rugcheck_cache: dict = {}
+_RUGCHECK_CACHE_TTL   = 300
+
+async def get_token_price(mint, pair_data=None):
     now = time.time()
-
-    # 2. Return cached price only if it is a real (>0) value and still fresh.
-    #    Failed lookups are cached briefly so we don't hammer APIs on every
-    #    monitor tick, but they expire faster so manual actions retry quickly.
     if mint in _price_cache:
         ts, p = _price_cache[mint]
-        if p > 0 and now - ts < _PRICE_CACHE_TTL:
-            return p
-        if p == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL:
-            return 0.0
+        if now - ts < _PRICE_CACHE_TTL and p > 0: return p
 
-    # 3. DexScreener — pick the most-liquid Solana pair
+    # stale-price guard: detect if last 3 cached prices are identical
+    if mint in _price_cache:
+        cached_val = _price_cache[mint][1]
+        stale_hist = getattr(get_token_price, "_stale_hist", {})
+        hist = stale_hist.get(mint, [])
+        hist.append(cached_val)
+        if len(hist) > 3: hist.pop(0)
+        stale_hist[mint] = hist
+        get_token_price._stale_hist = stale_hist
+        if len(hist) == 3 and len(set(hist)) == 1:
+            log.warning(f"Stale price feed detected for {mint[:8]} — skipping tick")
+            return 0.0  # signal to skip this monitoring tick
+
+    if pair_data:
+        try:
+            p = float(pair_data.get("priceUsd") or 0)
+            if p > 0:
+                state["api_stats"]["price_ok"] += 1
+                _price_cache[mint] = (now, p)
+                return p
+        except Exception: pass
+
+    # DexScreener
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-            async with s.get(f"{DEXSCREENER_API}{mint}") as r:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+            async with s.get(DEXSCREENER_API + mint) as r:
                 if r.status == 200:
-                    pairs = [p for p in ((await r.json()).get("pairs") or [])
-                             if p.get("chainId") == "solana"]
+                    pairs = [p for p in (await r.json()).get("pairs",[]) if p.get("chainId")=="solana"]
                     if pairs:
-                        # Sort by liquidity — the most liquid pair has the most reliable price
-                        pairs.sort(
-                            key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0),
-                            reverse=True,
-                        )
-                        price = float(pairs[0].get("priceUsd", 0) or 0)
+                        best = max(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0))
+                        price = float(best.get("priceUsd") or 0)
                         if price > 0:
                             state["api_stats"]["price_ok"] += 1
                             _price_cache[mint] = (now, price)
                             return price
-                elif r.status == 429:
-                    log.warning("DexScreener rate-limited, skipping to next source")
-    except Exception as e:
-        log.warning(f"DexScreener price: {e}")
+    except Exception as e: log.warning(f"DexScreener price: {e}")
 
-    # 4. Jupiter Price API v2 — price can be returned as a string, handle both
+    # Jupiter Price API v2
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
             async with s.get(f"{JUPITER_PRICE_API}?ids={mint}&showExtraInfo=false") as r:
                 if r.status == 200:
-                    raw = (await r.json()).get("data", {}).get(mint, {})
+                    raw   = (await r.json()).get("data", {}).get(mint, {})
                     price = float(raw.get("price") or 0)
                     if price > 0:
                         state["api_stats"]["price_ok"] += 1
                         _price_cache[mint] = (now, price)
                         return price
-    except Exception as e:
-        log.warning(f"Jupiter price API: {e}")
+    except Exception as e: log.warning(f"Jupiter price API: {e}")
 
-    # 5. Jupiter Quote fallback — derive price from a tiny 1-USDC → token quote
+    # Jupiter Quote fallback
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-            async with s.get(
-                JUPITER_QUOTE_API,
-                params={
-                    "inputMint": USDC_MINT,
-                    "outputMint": mint,
-                    "amount": 1_000_000,   # 1 USDC (6 decimals)
-                    "slippageBps": 500,
-                },
-            ) as r:
+            async with s.get(JUPITER_QUOTE_API,
+                params={"inputMint": USDC_MINT, "outputMint": mint,
+                        "amount": 1_000_000, "slippageBps": 500}) as r:
                 if r.status == 200:
                     q = await r.json()
                     out = int(q.get("outAmount", 0))
@@ -479,32 +497,28 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                         price = 1.0 / (out / (10 ** decimals))
                         state["api_stats"]["price_ok"] += 1
                         _price_cache[mint] = (now, price)
-                        log.info(f"Price via Jupiter quote fallback: {mint[:8]} = ${price:.8f}")
                         return price
-    except Exception as e:
-        log.warning(f"Jupiter quote fallback price: {e}")
+    except Exception as e: log.warning(f"Jupiter quote fallback price: {e}")
 
-    # 6. GeckoTerminal fallback
+    # GeckoTerminal fallback
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
-            url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}"
-            async with s.get(url, headers={"Accept": "application/json"}) as r:
+            async with s.get(f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
+                    headers={"Accept": "application/json"}) as r:
                 if r.status == 200:
                     price = float(
-                        (await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0
-                    )
+                        (await r.json()).get("data",{}).get("attributes",{}).get("price_usd") or 0)
                     if price > 0:
                         state["api_stats"]["price_ok"] += 1
                         _price_cache[mint] = (now, price)
-                        log.info(f"Price via GeckoTerminal: {mint[:8]} = ${price:.8f}")
                         return price
-    except Exception as e:
-        log.warning(f"GeckoTerminal price: {e}")
+    except Exception as e: log.warning(f"GeckoTerminal price: {e}")
 
     state["api_stats"]["price_fail"] += 1
     _price_cache[mint] = (now, 0.0)
     log.warning(f"All price sources failed for {mint[:16]}")
     return 0.0
+
 async def get_token_data(mint):
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
@@ -536,6 +550,33 @@ async def check_token_safety(mint):
         log.warning(f"RugCheck error {mint[:8]}: {e}")
     safe = {"score": 0, "risks": [], "rugged": False}
     _rugcheck_cache[mint] = (now, safe); return safe
+
+# ============================================================
+# WALLET CONCENTRATION CHECK  (Helius)
+# ============================================================
+async def check_wallet_concentration(mint) -> float:
+    """Returns top-10-holder % of supply. Returns 0.0 if unavailable."""
+    if not HELIUS_RPC:
+        return 0.0
+    try:
+        url = HELIUS_RPC.rstrip("/") + f"/v0/token-accounts?mint={mint}&limit=10"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+            async with s.get(url) as r:
+                if r.status != 200: return 0.0
+                data = await r.json()
+                accounts = data.get("token_accounts", [])
+                if not accounts: return 0.0
+                balances = [float(a.get("amount", 0)) for a in accounts]
+                total    = sum(balances)
+                # Fetch total supply from Solana RPC
+                supply_resp = await solana_client.get_token_supply(mint)
+                supply = float(supply_resp.value.ui_amount or 0) if supply_resp.value else 0
+                if supply <= 0: return 0.0
+                top10_pct = (total / supply) * 100
+                return top10_pct
+    except Exception as e:
+        log.warning(f"Wallet concentration check failed: {e}")
+        return 0.0
 
 # ============================================================
 # JUPITER
@@ -589,6 +630,16 @@ async def confirm_tx(sig):
         await asyncio.sleep(1)
     state["api_stats"]["confirm_timeout"] += 1; return False
 
+def _conviction_amount(ml_score: float) -> float:
+    """Scale trade amount by ML confidence if conviction_sizing is ON."""
+    s   = state["settings"]
+    amt = s["trade_amount"]
+    if not s.get("conviction_sizing", True): return amt
+    if ml_score >= 0.80: return amt          # full size
+    if ml_score >= 0.65: return amt * 0.75  # 75%
+    if ml_score >= 0.50: return amt * 0.50  # 50%
+    return amt * 0.25                        # minimal
+
 async def execute_buy(mint, amt):
     q = await get_quote(USDC_MINT, mint, int(amt*1e6), state["settings"]["slippage_bps"])
     if not q: return None
@@ -614,24 +665,30 @@ async def execute_sell(mint, token_amt):
 # ============================================================
 def kb_main():
     s = state["settings"]
+    paused = time.time() < state.get("sniper_paused_until", 0)
+    sniper_lbl = ("⏸ Sniper PAUSED" if paused else
+                  ("🟢 Sniper ON" if s["auto_snipe"] else "🔴 Sniper OFF"))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 Positions",   callback_data="positions"),
          InlineKeyboardButton("📊 P&L",         callback_data="pnl")],
         [InlineKeyboardButton("🛒 Buy Token",   callback_data="buy_prompt"),
          InlineKeyboardButton("💸 Sell Token",  callback_data="sell_prompt")],
-        [InlineKeyboardButton("🟢 Sniper ON" if s["auto_snipe"] else "🔴 Sniper OFF", callback_data="toggle_sniper"),
-         InlineKeyboardButton("📝 Demo ON"   if s["demo_mode"]  else "📝 Demo OFF",   callback_data="toggle_demo")],
+        [InlineKeyboardButton(sniper_lbl,        callback_data="toggle_sniper"),
+         InlineKeyboardButton("📝 Demo ON"   if s["demo_mode"] else "📝 Demo OFF",
+                              callback_data="toggle_demo")],
         [InlineKeyboardButton("📝 Demo Trades", callback_data="demo_menu"),
          InlineKeyboardButton("🧠 ML Stats",    callback_data="mlstats")],
         [InlineKeyboardButton("⚙️ Settings",    callback_data="settings_menu"),
          InlineKeyboardButton("🏥 Health",      callback_data="health")],
-        [InlineKeyboardButton("📜 History",     callback_data="history")],
+        [InlineKeyboardButton("📜 History",     callback_data="history"),
+         InlineKeyboardButton("📈 Analytics",   callback_data="analytics")],
     ])
 
 def kb_settings():
     s   = state["settings"]
     hm  = "🏠 House Money: ON"  if s.get("house_money_mode") else "🏠 House Money: OFF"
     mlo = "🧠 ML Real Only: ON" if s.get("ml_real_only")     else "🧠 ML Real Only: OFF"
+    cvs = "📐 Conv.Sizing: ON"  if s.get("conviction_sizing") else "📐 Conv.Sizing: OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🎯 Take Profit: {s['take_profit']}x",          callback_data="set_tp"),
          InlineKeyboardButton(f"📉 Trailing: {s['trailing_stop']}%",           callback_data="set_trail")],
@@ -645,10 +702,15 @@ def kb_settings():
          InlineKeyboardButton(f"📊 Vol5m≥: {s.get('min_vol5m_pct',10)}% liq", callback_data="set_vol5m")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
+        [InlineKeyboardButton(f"🚨 Daily Loss Limit: {s.get('daily_loss_limit_pct',20)}%",
+                              callback_data="set_daily_loss"),
+         InlineKeyboardButton(f"⚖️ Breakeven @ {s.get('breakeven_mult',2.0)}x",
+                              callback_data="set_be_mult")],
         [InlineKeyboardButton(hm,  callback_data="toggle_house_money"),
          InlineKeyboardButton(mlo, callback_data="toggle_ml_real_only")],
-        [InlineKeyboardButton("📐 Tiered Trail Settings", callback_data="tiered_trail_menu")],
-        [InlineKeyboardButton("⬅️ Back to Menu",          callback_data="main_menu")],
+        [InlineKeyboardButton(cvs, callback_data="toggle_conviction_sizing")],
+        [InlineKeyboardButton("📐 Tiered Trail & Profit-Take", callback_data="tiered_trail_menu")],
+        [InlineKeyboardButton("⬅️ Back to Menu",               callback_data="main_menu")],
     ])
 
 def kb_tiered_trail():
@@ -712,20 +774,28 @@ async def build_dashboard() -> str:
     n     = len(state["ml_features"])
     wins  = sum(1 for x in state["trades_history"] if x["net_pnl"] > 0)
     total = len(state["trades_history"])
+    paused = time.time() < state.get("sniper_paused_until", 0)
+    pause_txt = ""
+    if paused:
+        rem = (state["sniper_paused_until"] - time.time()) / 3600
+        pause_txt = f"\n⏸ *Sniper paused {rem:.1f}h* (daily loss limit)\n"
     msg = (
         f"🤖 *Solana Meme Coin Bot*\n{'─'*28}\n\n"
         f"*💼 Portfolio*\n"
-        f"├ Real P&L:  {'📈' if state['total_pnl']>=0 else '📉'} *${state['total_pnl']:+.2f}*\n"
-        f"├ Demo P&L:  📝 ${state['demo_total_pnl']:+.2f}\n"
-        f"├ Trades:    {total} ({wins}W / {total-wins}L)\n\n"
+        f"├ Real P&L:       {'📈' if state['total_pnl']>=0 else '📉'} *${state['total_pnl']:+.2f}*\n"
+        f"├ Today P&L:      {'📈' if state['daily_pnl']>=0 else '📉'} ${state['daily_pnl']:+.2f}\n"
+        f"├ Demo P&L:       📝 ${state['demo_total_pnl']:+.2f}\n"
+        f"├ Trades:         {total} ({wins}W / {total-wins}L)\n\n"
         f"*🤖 Bot Status*\n"
         f"├ Auto-Sniper: {'🟢 ON' if s['auto_snipe'] else '🔴 OFF'}\n"
         f"├ Demo Mode:   {'🟢 ON' if s['demo_mode']  else '🔴 OFF'}\n"
-        f"├ ML Model:    {'✅ Ready' if ml_ready else '⏳ Training'} ({n} samples)\n\n"
+        f"├ ML Model:    {'✅ Ready' if ml_ready else '⏳ Training'} ({n} samples)\n"
+        f"{pause_txt}\n"
         f"*⚙️ Active Settings*\n"
-        f"├ Take Profit:  {s['take_profit']}x\n"
-        f"├ Stop Loss:    {s['stop_loss']}x\n"
+        f"├ Take Profit:  {s['take_profit']}x  |  Stop: {s['stop_loss']}x\n"
+        f"├ Breakeven @:  {s.get('breakeven_mult',2.0)}x\n"
         f"├ House Money:  {'🏠 ON' if s.get('house_money_mode') else 'OFF'}\n"
+        f"├ Daily Limit:  -{s.get('daily_loss_limit_pct',20)}%\n"
         f"├ Min Liq:      ${s['min_liquidity']:,.0f}\n"
         f"├ Min Score:    {s['min_score']:.0%}\n"
         f"├ Max Pos:      {s.get('max_demo_positions',5)}D / {s.get('max_real_positions',3)}R\n"
@@ -738,7 +808,8 @@ async def build_dashboard() -> str:
             mult = p/pos["entry_price"] if p > 0 and pos["entry_price"] > 0 else 0
             pnl  = (mult-1)*pos["amount_usd"] - pos["fees_paid"]
             hm   = " 🏠" if pos.get("capital_recovered") else ""
-            msg += f"{'🟢' if pnl>=0 else '🔴'} {pos['symbol']}{hm} | {mult:.2f}x | ${pnl:+.2f}\n"
+            be   = " 🔒" if pos.get("breakeven_active") else ""
+            msg += f"{'🟢' if pnl>=0 else '🔴'} {pos['symbol']}{hm}{be} | {mult:.2f}x | ${pnl:+.2f}\n"
     return msg
 
 # ============================================================
@@ -755,14 +826,12 @@ async def _partial_sell_for_capital_recovery(app, mint, pos, current_price, is_d
     pfx = "📝 DEMO " if is_demo else ""
 
     if is_demo:
-        usdc_recovered = tokens_to_sell * current_price
-        net_recovered  = usdc_recovered - calc_fees(usdc_recovered)["dex_fee"]
+        usdc_back = tokens_to_sell * current_price
         await _safe_notify(app,
-            f"{pfx}🏠 *House Money — Capital Recovered!*\n\n*{pos['symbol']}*\n{'─'*20}\n"
-            f"├ Sold:           {sell_pct:.0%} of position\n"
-            f"├ USDC recovered: ${net_recovered:.2f}\n"
-            f"├ Original cost:  ${invested:.2f}\n"
-            f"├ Tokens riding:  {tokens_remaining:,.0f}\n"
+            f"🏠 {pfx}*House Money — Capital Recovered!*\n\n*{pos['symbol']}*\n{'─'*20}\n"
+            f"├ Sold:          {sell_pct:.0%} of position\n"
+            f"├ USDC recovered: ${usdc_back:.2f}\n"
+            f"├ Tokens riding: {int(tokens_remaining):,}\n"
             f"└ 🚀 Pure profit from here — trail active!")
     else:
         result = await execute_sell(mint, int(tokens_to_sell))
@@ -774,7 +843,7 @@ async def _partial_sell_for_capital_recovery(app, mint, pos, current_price, is_d
             f"├ Sold:           {sell_pct:.0%} of position\n"
             f"├ USDC recovered: ${result['usdc_received']:.2f}\n"
             f"├ Original cost:  ${invested:.2f}\n"
-            f"├ Tokens riding:  {tokens_remaining:,.0f}\n"
+            f"├ Tokens riding:  {int(tokens_remaining):,}\n"
             f"└ 🚀 Pure profit from here — trail active!\n\n"
             f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})")
 
@@ -785,52 +854,54 @@ async def _partial_sell_for_capital_recovery(app, mint, pos, current_price, is_d
     return True
 
 # ============================================================
-# TIERED PROFIT-TAKE — sell a slice at 5x / 10x / 20x
+# TIERED PROFIT-TAKE
 # ============================================================
 async def _tiered_profit_take(app, mint, pos, current_price, milestone: str, is_demo: bool):
-    """Sell `pct`% of remaining tokens at a milestone multiplier (5x/10x/20x)."""
-    s         = state["settings"]
-    pct_key   = f"pt_{milestone}_pct"
-    pct       = s.get(pct_key, 0.0) / 100.0
-    if pct <= 0:
-        return  # milestone disabled
+    s       = state["settings"]
+    pct     = s.get(f"pt_{milestone}_pct", 0.0) / 100.0
+    if pct <= 0: return
 
-    total_tokens = pos.get("token_amount", 0)
-    if total_tokens <= 0 or current_price <= 0:
-        return
+    total_tokens     = pos.get("token_amount", 0)
+    if total_tokens <= 0 or current_price <= 0: return
 
-    tokens_to_sell   = int(total_tokens * pct)
+    # Accelerate sell size if sell pressure is already rising
+    td = await get_token_data(mint)
+    sell_pressure_boost = 1.0
+    if td:
+        b5m = float(td.get("txns",{}).get("m5",{}).get("buys",0) or 0)
+        s5m = float(td.get("txns",{}).get("m5",{}).get("sells",0) or 0)
+        if b5m > 0 and s5m > b5m * state["settings"].get("sell_ratio_flip_threshold", 1.5):
+            sell_pressure_boost = 1.5  # sell 50% more than planned
+            log.info(f"Sell pressure detected at {milestone} for {pos['symbol']} — boosting PT size")
+
+    tokens_to_sell   = int(total_tokens * min(pct * sell_pressure_boost, 0.95))
     tokens_remaining = total_tokens - tokens_to_sell
     usdc_estimate    = tokens_to_sell * current_price
     pfx = "📝 DEMO " if is_demo else ""
+    boost_note = " _(sell pressure detected — size boosted)_" if sell_pressure_boost > 1 else ""
 
     if is_demo:
-        sell_fee = calc_fees(usdc_estimate)["dex_fee"]
+        sell_fee      = calc_fees(usdc_estimate)["dex_fee"]
         usdc_received = usdc_estimate - sell_fee
+        sig_link      = ""
     else:
         result = await execute_sell(mint, tokens_to_sell)
         if not result:
-            await _safe_notify(app,
-                f"⚠️ *{pfx}Profit-take FAILED at {milestone} for {pos['symbol']}*")
+            await _safe_notify(app, f"⚠️ *{pfx}Profit-take FAILED at {milestone} for {pos['symbol']}*")
             return
         usdc_received = result["usdc_received"]
-        sell_fee      = calc_fees(usdc_received)["dex_fee"]
+        sig_link      = f"\n🔗 [Solscan](https://solscan.io/tx/{result['signature']})"
 
-    pos["token_amount"] = tokens_remaining
-    flag_key = f"pt_{milestone}_done"
-    pos[flag_key] = True
+    pos["token_amount"]          = tokens_remaining
+    pos[f"pt_{milestone}_done"]  = True
     await db_save_position(mint, pos, is_demo)
-
-    sig_link = ""
-    if not is_demo and result:
-        sig_link = f"\n🔗 [Solscan](https://solscan.io/tx/{result['signature']})"
 
     await _safe_notify(app,
         f"💰 {pfx}*Profit-Take @ {milestone} — {pos['symbol']}*\n{'─'*22}\n"
-        f"├ Sold:       {pct:.0%} of position ({tokens_to_sell:,} tokens)\n"
-        f"├ USDC in:    ${usdc_received:.2f}\n"
-        f"├ Remaining:  {tokens_remaining:,} tokens\n"
-        f"└ Still riding with tiered trail 🚀{sig_link}")
+        f"├ Sold:      {tokens_to_sell:,} tokens ({pct*sell_pressure_boost:.0%}){boost_note}\n"
+        f"├ USDC in:   ${usdc_received:.2f}\n"
+        f"├ Remaining: {tokens_remaining:,} tokens\n"
+        f"└ Riding with tiered trail 🚀{sig_link}")
 
 # ============================================================
 # CLOSE POSITION
@@ -839,6 +910,7 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
     entry = pos["entry_price"]
     mult  = price / entry if entry > 0 else 1
     hm    = pos.get("capital_recovered", False)
+    hold_secs = time.time() - pos.get("entry_time", time.time())
 
     if hm:
         token_amt = pos.get("token_amount", 0)
@@ -871,32 +943,42 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
 
     ml_msg = ""
     if pos.get("features"):
-        acc    = await record_trade_outcome(pos["features"], net_pnl > 0, is_demo=is_demo)
+        # Label as win only if ≥2x (trains model toward moonshots, not marginal wins)
+        is_real_win = mult >= 2.0
+        acc    = await record_trade_outcome(pos["features"], is_real_win, is_demo=is_demo)
         ml_msg = f"\n🧠 ML updated ({len(state['ml_features'])} samples)"
         if acc: ml_msg += f" | Precision: {acc:.0%}"
 
     await db_save_trade({"symbol": pos["symbol"], "mint": mint, "entry": entry, "exit": price,
         "mult": mult, "net_pnl": net_pnl, "fees_paid": pos["fees_paid"]+sell_fee,
-        "reason": reason, "is_demo": is_demo, "tx_sig": tx_sig, "features": pos.get("features",[])})
+        "reason": reason, "is_demo": is_demo, "tx_sig": tx_sig, "features": pos.get("features",[]),
+        "hold_seconds": hold_secs})
     await db_delete_position(mint)
 
     if is_demo:
         state["demo_total_pnl"] += net_pnl
-        state["demo_trades"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl, "reason": reason,
+        state["demo_trades"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl,
+            "reason": reason, "hold_seconds": hold_secs,
             "projected_real": net_pnl*(state["settings"]["trade_amount"]/state["settings"]["demo_trade_amount"])})
         del state["demo_positions"][mint]
     else:
-        state["total_pnl"] += net_pnl
-        state["trades_history"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl, "reason": reason})
+        state["total_pnl"]  += net_pnl
+        state["daily_pnl"]  += net_pnl
+        if net_pnl < 0:
+            state["recent_losses"][mint] = time.time()  # block revenge re-entry 24h
+        state["trades_history"].append({"symbol": pos["symbol"], "mult": mult,
+            "net_pnl": net_pnl, "reason": reason, "hold_seconds": hold_secs})
         del state["positions"][mint]
+        _check_daily_loss_limit()
 
     pfx       = "📝 DEMO " if is_demo else ""
     pnl_total = state["demo_total_pnl"] if is_demo else state["total_pnl"]
     lbl       = "Demo" if is_demo else "Real"
     hm_tag    = "\n🏠 _(Capital already recovered — pure profit)_" if hm else ""
+    hold_txt  = f"{int(hold_secs//60)}m {int(hold_secs%60)}s"
     await _safe_notify(app,
         f"{'✅' if net_pnl>0 else '❌'} {pfx}{reason}\n\n"
-        f"*{pos['symbol']}* | {mult:.2f}x\n{'─'*20}\n"
+        f"*{pos['symbol']}* | {mult:.2f}x | held {hold_txt}\n{'─'*20}\n"
         f"├ Entry:    ${entry:.6f}\n├ Exit:     ${price:.6f}\n"
         f"├ Invested: ${pos['amount_usd']:.2f}\n├ Back:     ${usdc_bk:.2f}\n"
         f"├ Fees:     -${pos['fees_paid']+sell_fee:.4f}\n"
@@ -904,7 +986,71 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
         f"{proj_txt}💰 {lbl} P&L: ${pnl_total:+.2f}{sig_link}{ml_msg}{hm_tag}")
 
 # ============================================================
-# AUTO-SNIPER
+# SAFE NOTIFY
+# ============================================================
+async def _safe_notify(app, text):
+    try:
+        await app.bot.send_message(chat_id=AUTHORIZED_USER, text=text,
+            parse_mode="Markdown", disable_web_page_preview=True)
+    except TelegramError as e:
+        log.error(f"Notify failed: {e}")
+
+# ============================================================
+# TOKEN EVALUATION
+# ============================================================
+async def evaluate_new_token(td):
+    s      = state["settings"]
+    symbol = (td.get("baseToken") or td.get("token") or {}).get("symbol","???")
+    liq    = float(td.get("liquidity",{}).get("usd",0) or 0)
+    vol24  = float(td.get("volume",{}).get("h24",0) or 0)
+    vol5m  = float(td.get("volume",{}).get("m5",0) or 0)
+    pc1    = float(td.get("priceChange",{}).get("h1",0) or 0)
+    mcap   = float(td.get("marketCap",0) or 0)
+    age_ms = td.get("pairCreatedAt") or (time.time()*1000)
+    age_s  = max(0, (time.time()*1000 - age_ms) / 1000)
+    b5m    = float(td.get("txns",{}).get("m5",{}).get("buys",0) or 0)
+    s5m    = float(td.get("txns",{}).get("m5",{}).get("sells",0) or 0)
+    mint   = (td.get("baseToken") or td.get("token") or {}).get("address","")
+
+    safety   = await check_token_safety(mint) if mint else {"score":0,"risks":[],"rugged":False}
+    features = extract_features(td)
+    ml_score = predict_score(features)
+    vol5m_pct = (vol5m / liq * 100) if liq > 0 else 0
+
+    # Wallet concentration check
+    top10_pct = await check_wallet_concentration(mint) if mint else 0.0
+    max_conc  = s.get("max_wallet_concentration", 40.0)
+
+    # Wash-trade detection: avg buy size vs sell size
+    avg_buy_usd  = (vol5m / b5m) if b5m > 0 else 0
+    avg_sell_usd = (vol5m / s5m) if s5m > 0 else 0
+    wash_suspect = (avg_buy_usd > 0 and avg_sell_usd > 0 and
+                    avg_buy_usd / avg_sell_usd > 10)  # buys 10x larger = few wallets
+
+    passes = (
+        liq    >= s["min_liquidity"] and
+        age_s  >= s["min_token_age_sec"] and
+        safety["score"] <= s["min_rugcheck"] and
+        not safety["rugged"] and
+        vol5m_pct >= s.get("min_vol5m_pct", 10.0) and
+        (top10_pct == 0 or top10_pct <= max_conc) and
+        not wash_suspect
+    )
+
+    return {
+        "symbol": symbol, "liquidity": liq, "volume": vol24,
+        "vol5m": vol5m, "vol5m_pct": vol5m_pct,
+        "price_change": pc1, "market_cap": mcap,
+        "age_sec": age_s, "safety": safety,
+        "features": features, "ml_score": ml_score,
+        "rc_score": safety["score"],
+        "top10_pct": top10_pct,
+        "wash_suspect": wash_suspect,
+        "passes_rules": passes,
+    }
+
+# ============================================================
+# AUTO-SNIPER HELPERS
 # ============================================================
 async def _fetch_full_pair(session, mint):
     try:
@@ -918,10 +1064,9 @@ async def _fetch_full_pair(session, mint):
 async def fetch_new_pairs():
     now    = time.time()
     expiry = state["settings"].get("seen_expiry_sec", 7200)
-    for m in [m for m, t in state["seen_pairs"].items() if now - t > expiry]:
+    for m in [m for m, t in list(state["seen_pairs"].items()) if now - t > expiry]:
         del state["seen_pairs"][m]
 
-    new_mints = []
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=600, force_close=False)
     async with aiohttp.ClientSession(connector=connector,
         timeout=aiohttp.ClientTimeout(total=10, connect=4),
@@ -943,7 +1088,6 @@ async def fetch_new_pairs():
                             mint = ((item.get("baseToken") or item.get("token") or {}).get("address")
                                     or item.get("tokenAddress") or item.get("mint") or item.get("address"))
                             if mint and mint not in state["seen_pairs"]: found.append(mint)
-                        log.info(f"_discover [{label}]: {len(found)} new mints")
                         return found
                 except asyncio.TimeoutError:
                     if attempt == 0: await asyncio.sleep(0.5)
@@ -957,102 +1101,39 @@ async def fetch_new_pairs():
             _discover("https://api.dexscreener.com/orders/v1/solana"),
             _discover("https://api.dexscreener.com/token-boosts/top/v1"),
         )
-        for batch in discovered:
-            for mint in batch:
-                if mint not in new_mints: new_mints.append(mint)
-        if not new_mints: return []
-        hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:40]])
+        all_mints = list({m for sub in discovered for m in sub})
 
-    return [p for p in hydrated if p is not None]
+        tasks   = [_fetch_full_pair(session, m) for m in all_mints]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if r and not isinstance(r, Exception)]
 
-async def evaluate_new_token(pair):
-    base   = pair.get("baseToken") or pair.get("token") or {}
-    mint   = base.get("address") or pair.get("tokenAddress", "")
-    symbol = base.get("symbol") or pair.get("symbol", "???")
-    liq    = float(pair.get("liquidity",{}).get("usd",0) or 0)
-    vol5m  = float(pair.get("volume",{}).get("m5",0) or 0)
-    vol24  = float(pair.get("volume",{}).get("h24",0) or 0)
-
-    features = extract_features(pair)
-    ml_score = predict_score(features)
-    safety   = await check_token_safety(mint)
-    rugged   = safety.get("rugged", False)
-    rc_score = int(safety.get("score", 0) or 0)
-
-    s             = state["settings"]
-    min_liq       = s["min_liquidity"]
-    min_score     = s["min_score"]
-    min_age_sec   = s.get("min_token_age_sec", 120)
-    min_vol5m_pct = s.get("min_vol5m_pct", 10.0)
-    rc_too_risky  = rc_score > s.get("min_rugcheck", RUGCHECK_SCORE_MIN)
-
-    pair_created = pair.get("pairCreatedAt")
-    age_sec      = (time.time()*1000 - pair_created)/1000 if pair_created else 9999
-    vol5m_pct    = (vol5m / liq * 100) if liq > 0 else 0
-
-    passes = (liq >= min_liq and ml_score >= min_score and not rugged
-              and not rc_too_risky and age_sec >= min_age_sec and vol5m_pct >= min_vol5m_pct)
-
-    if not passes:
-        reasons = []
-        if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
-        if ml_score < min_score:      reasons.append(f"ml={ml_score:.0%}<{min_score:.0%}")
-        if rugged:                    reasons.append("rugged")
-        if rc_too_risky:              reasons.append(f"rug={rc_score}")
-        if age_sec < min_age_sec:     reasons.append(f"age={age_sec:.0f}s<{min_age_sec}s")
-        if vol5m_pct < min_vol5m_pct: reasons.append(f"vol5m={vol5m_pct:.1f}%<{min_vol5m_pct}%")
-        log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
-
-    return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
-            "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
-            "market_cap": float(pair.get("marketCap",0) or 0),
-            "price_change": float(pair.get("priceChange",{}).get("h1",0) or 0),
-            "ml_score": ml_score, "safety": safety, "rc_score": rc_score,
-            "features": features, "passes_rules": passes}
-
-RAYDIUM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-
-async def _handle_snipe(app, mint, pair, info):
-    risks = ", ".join([r.get("name","") for r in info["safety"].get("risks",[])]) or "None"
-    age_min = info.get("age_sec", 0) / 60
-    notif = (
-        f"⚡ *New Pool Detected*\n{'─'*24}\n💹 *{info['symbol']}*\n"
-        f"├ Liquidity:  ${info['liquidity']:,.0f}\n"
-        f"├ Vol5m:      ${info.get('vol5m',0):,.0f} ({info.get('vol5m_pct',0):.1f}%)\n"
-        f"├ Age:        {age_min:.1f} min\n"
-        f"├ ML Score:   {info['ml_score']:.0%}\n"
-        f"├ RugCheck:   {info['rc_score']}\n└ Risks:      {risks}\n"
-    )
-    if state["settings"]["demo_mode"]:
-        price = await get_token_price(mint, pair_data=pair)
-        if price <= 0: return
-        amt  = state["settings"]["demo_trade_amount"]
+async def _handle_snipe(app, mint, pair_data, info):
+    s = state["settings"]
+    if mint in state["recent_losses"]:
+        if time.time() - state["recent_losses"][mint] < 86400:
+            log.info(f"Skipping {info['symbol']} — recent loss on this token (revenge guard)")
+            return
+    price = await get_token_price(mint, pair_data=pair_data)
+    if price <= 0: return
+    amt   = _conviction_amount(info["ml_score"])
+    result = await execute_buy(mint, amt)
+    if result:
         fees = calc_fees(amt)
         pos  = {"symbol": info["symbol"], "entry_price": price, "current_price": price,
-                "peak_price": price, "amount_usd": amt-fees["total"], "fees_paid": fees["total"],
-                "token_amount": (amt-fees["total"])/price,
-                "tp_hit": False, "features": info["features"], "ml_score": info["ml_score"], "auto": True}
-        state["demo_positions"][mint] = pos
-        await db_save_position(mint, pos, True)
-        await _safe_notify(app, notif + f"\n📝 *DEMO Auto-bought @ ${price:.6f}*")
-    elif state["settings"]["auto_snipe"]:
-        price = await get_token_price(mint, pair_data=pair)
-        if price <= 0: return
-        await _safe_notify(app, notif + "\n🤖 *Auto-sniping...*")
-        result = await execute_buy(mint, state["settings"]["trade_amount"])
-        if result:
-            amt  = state["settings"]["trade_amount"]
-            fees = calc_fees(amt)
-            pos  = {"symbol": info["symbol"], "entry_price": price, "current_price": price,
-                    "peak_price": price, "amount_usd": amt-fees["total"],
-                    "token_amount": result["out_amount"], "fees_paid": fees["total"],
-                    "tp_hit": False, "features": info["features"], "auto": True}
-            state["positions"][mint] = pos
-            await db_save_position(mint, pos, False)
-            await _safe_notify(app, f"✅ *Sniped {info['symbol']}!*\nEntry: ${price:.6f}\n"
-                f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})")
-        else:
-            await _safe_notify(app, f"❌ Snipe failed for {info['symbol']}")
+                "peak_price": price, "amount_usd": amt-fees["total"],
+                "token_amount": result["out_amount"], "fees_paid": fees["total"],
+                "tp_hit": False, "features": info["features"], "auto": True,
+                "entry_time": time.time(),
+                "peak_vol5m": float(pair_data.get("volume",{}).get("m5",0) or 0)}
+        state["positions"][mint] = pos
+        await db_save_position(mint, pos, False)
+        await _safe_notify(app,
+            f"✅ *Sniped {info['symbol']}!*\n"
+            f"├ Entry:   ${price:.6f}\n"
+            f"├ Amount:  ${amt:.2f} ({info['ml_score']:.0%} confidence)\n"
+            f"└ 🔗 [Solscan](https://solscan.io/tx/{result['signature']})")
+    else:
+        await _safe_notify(app, f"❌ Snipe failed for {info['symbol']}")
 
 async def raydium_ws_sniper(app):
     try: import websockets
@@ -1091,49 +1172,50 @@ async def auto_sniper_loop(app):
     consecutive_errors = 0; loop_count = 0
     while True:
         try:
+            _reset_daily_pnl_if_needed()
+            sniper_paused = _check_daily_loss_limit()
+
             if not state["settings"]["auto_snipe"] and not state["settings"]["demo_mode"]:
                 await asyncio.sleep(2); continue
+            if sniper_paused and not state["settings"]["demo_mode"]:
+                await asyncio.sleep(30); continue
+
             loop_count += 1
             new_pairs = await fetch_new_pairs(); consecutive_errors = 0
             if loop_count % 12 == 0:
                 log.info(f"Sniper #{loop_count}: {len(new_pairs)} pairs | demo={len(state['demo_positions'])} real={len(state['positions'])}")
 
-            new_tokens = []
             for pair in new_pairs:
                 base = pair.get("baseToken") or pair.get("token") or {}
                 mint = base.get("address") or pair.get("tokenAddress","")
                 if not mint or mint in state["seen_pairs"]: continue
                 state["seen_pairs"][mint] = time.time()
-                new_tokens.append((mint, pair))
-            if not new_tokens: await asyncio.sleep(2); continue
 
-            infos = await asyncio.gather(*[evaluate_new_token(p) for _,p in new_tokens], return_exceptions=True)
-
-            for (mint, pair), info in zip(new_tokens, infos):
-                if isinstance(info, Exception): continue
+                info = await evaluate_new_token(pair)
                 if not info["passes_rules"]: continue
                 if mint in state["positions"] or mint in state["demo_positions"]: continue
+                if mint in state["recent_losses"]:
+                    if time.time() - state["recent_losses"][mint] < 86400: continue
 
-                # Position limit check
                 s = state["settings"]
-                if s["demo_mode"] and len(state["demo_positions"]) >= s.get("max_demo_positions",5):
-                    log.info(f"Demo position limit reached, skipping {info['symbol']}"); continue
-                if s["auto_snipe"] and not s["demo_mode"] and len(state["positions"]) >= s.get("max_real_positions",3):
-                    log.info(f"Real position limit reached, skipping {info['symbol']}"); continue
+                if s["demo_mode"] and len(state["demo_positions"]) >= s.get("max_demo_positions",5): continue
+                if s["auto_snipe"] and not s["demo_mode"] and len(state["positions"]) >= s.get("max_real_positions",3): continue
 
                 age_min = info.get("age_sec",0)/60
                 risks   = ", ".join([r.get("name","") for r in info["safety"].get("risks",[])]) or "None"
+                conc_txt = f"{info['top10_pct']:.1f}%" if info['top10_pct'] > 0 else "N/A"
                 notif = (
                     f"🔍 *New Token Detected*\n{'─'*24}\n🪙 *{info['symbol']}*\n"
-                    f"├ Liquidity:  ${info['liquidity']:,.0f}\n"
-                    f"├ Volume 24h: ${info['volume']:,.0f}\n"
-                    f"├ Vol5m:      ${info.get('vol5m',0):,.0f} ({info.get('vol5m_pct',0):.1f}% of liq)\n"
-                    f"├ Age:        {age_min:.1f} min\n"
-                    f"├ Market Cap: ${info['market_cap']:,.0f}\n"
-                    f"├ Price 1h:   {info['price_change']:+.1f}%\n"
-                    f"├ ML Score:   {info['ml_score']:.0%} confidence\n"
-                    f"├ RugCheck:   {info['rc_score']} (lower=safer)\n"
-                    f"└ Risks:      {risks}\n"
+                    f"├ Liquidity:    ${info['liquidity']:,.0f}\n"
+                    f"├ Volume 24h:   ${info['volume']:,.0f}\n"
+                    f"├ Vol5m:        ${info.get('vol5m',0):,.0f} ({info.get('vol5m_pct',0):.1f}% of liq)\n"
+                    f"├ Age:          {age_min:.1f} min\n"
+                    f"├ Market Cap:   ${info['market_cap']:,.0f}\n"
+                    f"├ Price 1h:     {info['price_change']:+.1f}%\n"
+                    f"├ ML Score:     {info['ml_score']:.0%} confidence\n"
+                    f"├ Top-10 Hold:  {conc_txt}\n"
+                    f"├ RugCheck:     {info['rc_score']} (lower=safer)\n"
+                    f"└ Risks:        {risks}\n"
                 )
                 if s["demo_mode"]:
                     price = await get_token_price(mint, pair_data=pair)
@@ -1142,7 +1224,9 @@ async def auto_sniper_loop(app):
                     pos  = {"symbol": info["symbol"], "entry_price": price, "current_price": price,
                             "peak_price": price, "amount_usd": amt-fees["total"], "fees_paid": fees["total"],
                             "token_amount": (amt-fees["total"])/price,
-                            "tp_hit": False, "features": info["features"], "ml_score": info["ml_score"], "auto": True}
+                            "tp_hit": False, "features": info["features"], "ml_score": info["ml_score"],
+                            "auto": True, "entry_time": time.time(),
+                            "peak_vol5m": float(pair.get("volume",{}).get("m5",0) or 0)}
                     state["demo_positions"][mint] = pos
                     await db_save_position(mint, pos, True)
                     await _safe_notify(app, notif + f"\n📝 *DEMO Auto-bought @ ${price:.6f}*")
@@ -1150,22 +1234,9 @@ async def auto_sniper_loop(app):
                     if info["ml_score"] < s["min_score"]:
                         await _safe_notify(app, notif + f"\n⚠️ *Skipped — ML {info['ml_score']:.0%} < {s['min_score']:.0%}*")
                         continue
-                    price = await get_token_price(mint, pair_data=pair)
-                    if price <= 0: continue
                     await _safe_notify(app, notif + "\n🤖 *Auto-sniping...*")
-                    result = await execute_buy(mint, s["trade_amount"])
-                    if result:
-                        fees = calc_fees(s["trade_amount"])
-                        pos  = {"symbol": info["symbol"], "entry_price": price, "current_price": price,
-                                "peak_price": price, "amount_usd": s["trade_amount"]-fees["total"],
-                                "token_amount": result["out_amount"], "fees_paid": fees["total"],
-                                "tp_hit": False, "features": info["features"], "auto": True}
-                        state["positions"][mint] = pos
-                        await db_save_position(mint, pos, False)
-                        await _safe_notify(app, f"✅ *Sniped {info['symbol']}!*\nEntry: ${price:.6f}\n"
-                            f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})")
-                    else:
-                        await _safe_notify(app, f"❌ Snipe failed for {info['symbol']}")
+                    await _handle_snipe(app, mint, pair, info)
+
         except Exception as e:
             consecutive_errors += 1; log_error("auto_sniper_loop", e)
             if consecutive_errors >= 5:
@@ -1185,7 +1256,9 @@ def _tiered_trail(peak_mult: float) -> float:
 
 async def monitor_positions(app):
     log.info("Position monitor started.")
-    price_history: dict = {}
+    price_history: dict = {}  # mint -> [(ts, price), ...]
+    vol5m_history: dict = {}  # mint -> [vol5m, ...]
+
     while True:
         await asyncio.sleep(0.5)
         for is_demo, pool in [(False, state["positions"]), (True, state["demo_positions"])]:
@@ -1197,59 +1270,94 @@ async def monitor_positions(app):
             for mint, pos in list(pool.items()):
                 try:
                     price = price_map.get(mint, 0.0)
-                    if price <= 0: continue
+                    if price <= 0: continue  # stale feed — skip tick
                     pos["current_price"] = price
                     entry = pos["entry_price"]; mult = price / entry
                     tp = state["settings"]["take_profit"]; sl = state["settings"]["stop_loss"]
 
+                    # Price history (momentum)
                     if mint not in price_history: price_history[mint] = []
                     price_history[mint].append((time.time(), price))
                     if len(price_history[mint]) > 20: price_history[mint].pop(0)
-                    if price > pos.get("peak_price", entry): pos["peak_price"] = price
 
+                    # Peak tracking
+                    if price > pos.get("peak_price", entry): pos["peak_price"] = price
                     peak_mult        = pos["peak_price"] / entry if entry > 0 else 1.0
                     post_tp_trail    = _tiered_trail(peak_mult)
                     trailing_trigger = pos["peak_price"] * (1 - post_tp_trail)
 
-                    # ── Tiered profit-take milestones ──────────────────────────
+                    # ── Breakeven stop ──────────────────────────────────────────
+                    be_mult = state["settings"].get("breakeven_mult", 2.0)
+                    if mult >= be_mult and not pos.get("breakeven_active"):
+                        pos["breakeven_active"] = True
+                        pos["stop_loss_floor"]  = entry  # dynamic floor at entry
+                        await db_save_position(mint, pos, is_demo)
+                        log.info(f"Breakeven activated for {pos['symbol']} @ {mult:.2f}x")
+
+                    # ── Tiered profit-take milestones ───────────────────────────
                     for milestone, threshold in [("5x", 5.0), ("10x", 10.0), ("20x", 20.0)]:
-                        flag = f"pt_{milestone}_done"
-                        if mult >= threshold and not pos.get(flag):
+                        if mult >= threshold and not pos.get(f"pt_{milestone}_done"):
                             await _tiered_profit_take(app, mint, pos, price, milestone, is_demo)
 
+                    # ── Live 5m volume tracking (dump exhaustion) ───────────────
+                    td = await get_token_data(mint)
+                    b5m_live = 0.0; s5m_live = 0.0; vol5m_live = 0.0
+                    if td:
+                        vol5m_live = float(td.get("volume",{}).get("m5",0) or 0)
+                        b5m_live   = float(td.get("txns",{}).get("m5",{}).get("buys",0) or 0)
+                        s5m_live   = float(td.get("txns",{}).get("m5",{}).get("sells",0) or 0)
+                        # Update peak 5m volume
+                        if vol5m_live > pos.get("peak_vol5m", 0):
+                            pos["peak_vol5m"] = vol5m_live
+                        if mint not in vol5m_history: vol5m_history[mint] = []
+                        vol5m_history[mint].append(vol5m_live)
+                        if len(vol5m_history[mint]) > 10: vol5m_history[mint].pop(0)
+
                     reason = None
+
+                    # ── Stop loss ───────────────────────────────────────────────
                     if mult <= sl:
                         reason = f"🔴 Stop Loss at {mult:.2f}x"
+                    # ── Breakeven floor (never lose once 2x hit) ────────────────
+                    elif pos.get("breakeven_active") and price <= entry:
+                        reason = f"🔒 Breakeven Stop at {mult:.2f}x"
                     elif pos.get("tp_hit"):
-                        # ── House Money guard ──────────────────────────────────────────
-                        # If house money mode is ON and capital hasn't been recovered yet,
-                        # attempt the partial sell NOW (in case it failed or was missed on
-                        # the TP tick) and skip closing this tick so the trail can run on
-                        # pure-profit tokens.
+                        # House money recovery guard
                         if (state["settings"].get("house_money_mode")
                                 and not pos.get("capital_recovered")):
-                            log.info(f"House money recovery pending for {pos['symbol']} — attempting before trail exit")
                             ok = await _partial_sell_for_capital_recovery(app, mint, pos, price, is_demo)
                             await db_save_position(mint, pos, is_demo)
-                            if not ok:
-                                # Recovery failed (e.g. real sell failed) — let trail/momentum run normally
-                                log.warning(f"House money recovery failed for {pos['symbol']} — allowing exit")
-                            else:
-                                # Capital secured — skip close this tick, let trail do its job
-                                continue
+                            if ok: continue
 
-                        hist = price_history.get(mint, [])
-                        momentum_exit = False
-                        if len(hist) >= 5:
-                            old_p = hist[-5][1]
-                            drop  = (old_p - price) / old_p if old_p > 0 else 0
-                            if drop > 0.03:
-                                momentum_exit = True
-                                log.info(f"Momentum exit: {pos['symbol']} -{drop:.1%}")
-                        if price <= trailing_trigger:
+                        # ── Early dump detection ────────────────────────────────
+                        early_exit_reason = None
+
+                        # 1. Buy/sell ratio flip
+                        flip_thresh = state["settings"].get("sell_ratio_flip_threshold", 1.5)
+                        if b5m_live > 0 and s5m_live > b5m_live * flip_thresh:
+                            early_exit_reason = f"🚨 Sell Pressure Exit at {mult:.2f}x (sells {s5m_live:.0f} vs buys {b5m_live:.0f})"
+
+                        # 2. Volume exhaustion
+                        if not early_exit_reason:
+                            peak_v = pos.get("peak_vol5m", 0)
+                            exhaust_pct = state["settings"].get("vol_exhaustion_pct", 30.0) / 100
+                            if peak_v > 0 and vol5m_live > 0 and vol5m_live < peak_v * exhaust_pct:
+                                early_exit_reason = f"📉 Volume Exhaustion Exit at {mult:.2f}x (vol {vol5m_live:.0f} < {exhaust_pct:.0%} of peak {peak_v:.0f})"
+
+                        # 3. Momentum drop (price action)
+                        if not early_exit_reason:
+                            hist = price_history.get(mint, [])
+                            if len(hist) >= 5:
+                                old_p = hist[-5][1]
+                                drop  = (old_p - price) / old_p if old_p > 0 else 0
+                                if drop > 0.03:
+                                    early_exit_reason = f"⚡ Momentum Exit at {mult:.2f}x (-{drop:.1%} in 5 ticks)"
+
+                        if early_exit_reason:
+                            reason = early_exit_reason
+                        elif price <= trailing_trigger:
                             reason = f"🟡 Trailing Stop at {mult:.2f}x ({int(post_tp_trail*100)}% trail from {peak_mult:.1f}x peak)"
-                        elif momentum_exit:
-                            reason = f"⚡ Momentum Exit at {mult:.2f}x"
+
                     elif mult >= tp and not pos.get("tp_hit"):
                         pos["tp_hit"] = True
                         trail_pct = int(_tiered_trail(mult) * 100)
@@ -1269,6 +1377,7 @@ async def monitor_positions(app):
 
                     if reason:
                         price_history.pop(mint, None)
+                        vol5m_history.pop(mint, None)
                         await _close_position(app, mint, pos, price, reason, is_demo)
                 except Exception as e:
                     log_error(f"monitor/{mint[:8]}", e)
@@ -1276,6 +1385,16 @@ async def monitor_positions(app):
 # ============================================================
 # CALLBACK HANDLER
 # ============================================================
+def auth(fn):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id if update.effective_user else None
+        if uid != AUTHORIZED_USER:
+            await update.effective_message.reply_text("⛔ Unauthorized.")
+            return ConversationHandler.END
+        return await fn(update, ctx)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
 @auth
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; data = q.data
@@ -1292,7 +1411,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
 async def _button_handler_inner(update, ctx, q, data):
-    app = ctx.application  # needed by _close_position calls throughout this handler
+    app = ctx.application
     if data == "main_menu":
         await q.edit_message_text(await build_dashboard(), parse_mode="Markdown", reply_markup=kb_main())
 
@@ -1306,7 +1425,8 @@ async def _button_handler_inner(update, ctx, q, data):
                 mult = p/pos["entry_price"] if p > 0 else 0
                 pnl  = (mult-1)*pos["amount_usd"] - pos["fees_paid"]
                 hm   = " 🏠" if pos.get("capital_recovered") else ""
-                lines.append(f"{'🟢' if pnl>=0 else '🔴'} *{pos['symbol']}*{hm} | {mult:.2f}x | ${pnl:+.2f}")
+                be   = " 🔒" if pos.get("breakeven_active") else ""
+                lines.append(f"{'🟢' if pnl>=0 else '🔴'} *{pos['symbol']}*{hm}{be} | {mult:.2f}x | ${pnl:+.2f}")
             await q.edit_message_text("*📂 Open Positions*\n\n" + "\n".join(lines),
                 parse_mode="Markdown", reply_markup=kb_positions(state["positions"]))
 
@@ -1315,8 +1435,47 @@ async def _button_handler_inner(update, ctx, q, data):
         await q.edit_message_text(
             f"{'📈' if state['total_pnl']>=0 else '📉'} *P&L Summary*\n\n"
             f"├ Real P&L:     *${state['total_pnl']:+.2f}*\n"
+            f"├ Today P&L:    ${state['daily_pnl']:+.2f}\n"
             f"├ Demo P&L:     ${state['demo_total_pnl']:+.2f}\n"
             f"├ Total Trades: {len(t)}\n├ Wins: {wins}\n└ Losses: {len(t)-wins}",
+            parse_mode="Markdown", reply_markup=kb_main())
+
+    elif data == "analytics":
+        t = state["trades_history"]
+        if not t:
+            await q.edit_message_text("📭 No trades yet for analytics.", reply_markup=kb_main()); return
+        wins   = [x for x in t if x["net_pnl"] > 0]
+        losses = [x for x in t if x["net_pnl"] <= 0]
+        avg_hold_w = sum(x.get("hold_seconds",0) for x in wins) / max(len(wins),1)
+        avg_hold_l = sum(x.get("hold_seconds",0) for x in losses) / max(len(losses),1)
+        avg_mult_w = sum(x["mult"] for x in wins) / max(len(wins),1)
+        avg_mult_l = sum(x["mult"] for x in losses) / max(len(losses),1)
+        # Win rate by reason
+        reason_counts: dict = {}
+        for x in t:
+            r = x.get("reason","?")[:30]
+            reason_counts[r] = reason_counts.get(r,{"w":0,"l":0})
+            if x["net_pnl"] > 0: reason_counts[r]["w"] += 1
+            else: reason_counts[r]["l"] += 1
+        reason_lines = "\n".join(
+            f"  {r}: {d['w']}W/{d['l']}L" for r,d in list(reason_counts.items())[:6])
+        # ML score buckets (if features exist — use stored trades)
+        paused = time.time() < state.get("sniper_paused_until", 0)
+        pause_txt = ""
+        if paused:
+            rem = (state["sniper_paused_until"] - time.time()) / 3600
+            pause_txt = f"\n⏸ Sniper paused {rem:.1f}h remaining"
+        await q.edit_message_text(
+            f"📈 *Trade Analytics*\n{'─'*26}\n\n"
+            f"*Win/Loss*\n"
+            f"├ Wins:         {len(wins)} ({len(wins)/max(len(t),1):.0%})\n"
+            f"├ Avg win:      {avg_mult_w:.2f}x / ${sum(x['net_pnl'] for x in wins)/max(len(wins),1):+.2f}\n"
+            f"├ Avg loss:     {avg_mult_l:.2f}x / ${sum(x['net_pnl'] for x in losses)/max(len(losses),1):+.2f}\n\n"
+            f"*Hold Time*\n"
+            f"├ Avg win hold:  {avg_hold_w/60:.1f} min\n"
+            f"└ Avg loss hold: {avg_hold_l/60:.1f} min\n\n"
+            f"*Exit Reasons*\n{reason_lines}"
+            f"{pause_txt}",
             parse_mode="Markdown", reply_markup=kb_main())
 
     elif data == "toggle_sniper":
@@ -1349,6 +1508,16 @@ async def _button_handler_inner(update, ctx, q, data):
             f"_When ON, ML trains only on real trades, not demo.\nRecommended once you have real trade history._",
             parse_mode="Markdown", reply_markup=kb_settings())
 
+    elif data == "toggle_conviction_sizing":
+        state["settings"]["conviction_sizing"] = not state["settings"].get("conviction_sizing", True)
+        await db_save_settings()
+        status = "🟢 ON" if state["settings"]["conviction_sizing"] else "🔴 OFF"
+        await q.edit_message_text(
+            f"⚙️ *Settings*\n\n📐 Conviction Sizing turned *{status}*\n\n"
+            f"_When ON, trade size scales with ML confidence:\n"
+            f"≥80% → full size | 65–79% → 75% | 50–64% → 50%_",
+            parse_mode="Markdown", reply_markup=kb_settings())
+
     elif data == "demo_menu":
         await q.edit_message_text("📝 *Demo Trading*", parse_mode="Markdown", reply_markup=kb_demo())
 
@@ -1362,43 +1531,40 @@ async def _button_handler_inner(update, ctx, q, data):
                 mult = p/pos["entry_price"] if p > 0 else 0
                 pnl  = (mult-1)*pos["amount_usd"] - pos["fees_paid"]
                 proj = pnl*(state["settings"]["trade_amount"]/state["settings"]["demo_trade_amount"])
-                tags = ("🎯" if pos.get("tp_hit") else "") + (" 🏠" if pos.get("capital_recovered") else "")
-                lines.append(f"{'🟢' if pnl>=0 else '🔴'} *{pos['symbol']}* {tags} | {mult:.2f}x | ${pnl:+.2f} → *${proj:+.2f}*")
-            await q.edit_message_text(
-                f"📝 *Demo Positions*\n\n" + "\n".join(lines) +
-                f"\n\n📊 Total: ${state['demo_total_pnl']:+.2f}",
+                tags = ("🎯" if pos.get("tp_hit") else "") + (" 🏠" if pos.get("capital_recovered") else "") + (" 🔒" if pos.get("breakeven_active") else "")
+                lines.append(f"{'🟢' if pnl>=0 else '🔴'} *{pos['symbol']}*{tags} | {mult:.2f}x | ${pnl:+.2f} (real≈${proj:+.2f})")
+            await q.edit_message_text("*📝 Demo Positions*\n\n" + "\n".join(lines),
                 parse_mode="Markdown", reply_markup=kb_positions(state["demo_positions"], is_demo=True))
 
     elif data == "demohistory":
         if not state["demo_trades"]:
             await q.edit_message_text("📭 No demo history yet.", reply_markup=kb_main())
         else:
-            lines = [f"{'✅' if t['net_pnl']>0 else '❌'} {t['symbol']} | {t['mult']:.2f}x | ${t['net_pnl']:+.2f} → ${t.get('projected_real',0):+.2f}"
+            lines = [f"{'✅' if t['net_pnl']>0 else '❌'} {t['symbol']} | {t['mult']:.2f}x | ${t['net_pnl']:+.2f} (real≈${t.get('projected_real',0):+.2f})"
                      for t in state["demo_trades"][-10:]]
-            await q.edit_message_text(f"📝 *Demo History*\n\n" + "\n".join(lines) +
-                f"\n\n📊 Total: ${state['demo_total_pnl']:+.2f}", parse_mode="Markdown", reply_markup=kb_main())
+            await q.edit_message_text("*📜 Demo History (last 10)*\n\n" + "\n".join(lines),
+                parse_mode="Markdown", reply_markup=kb_main())
 
     elif data == "mlstats":
-        from sklearn.metrics import precision_score, recall_score
         n = len(state["ml_features"])
-        if not ml_ready or n == 0:
-            await q.edit_message_text(f"🧠 *ML Model*\n\nNot ready yet. {n}/10 samples.\n\nTurn on Demo + Sniper to collect data!",
-                parse_mode="Markdown", reply_markup=kb_main())
-        else:
-            wins  = int(sum(state["ml_labels"]))
-            Xs    = ml_scaler.transform(state["ml_features"])
-            preds = ml_model.predict(Xs)
-            prec  = precision_score(state["ml_labels"], preds, zero_division=0)
-            rec   = recall_score(state["ml_labels"], preds, zero_division=0)
-            nms   = ["Liq","Vol24h","Δ1h","Δ6h","Δ24h","Buys1h","Sells1h","B/S","Age","Mcap","Vol5m","Buys5m","Sells5m","B/S5m","Liq/Mcap","Vol/Liq"]
-            top   = sorted(zip(nms, ml_model.feature_importances_), key=lambda x: -x[1])[:5]
-            ml_mode = "Real only" if state["settings"].get("ml_real_only") else "Demo + Real"
-            await q.edit_message_text(
-                f"🧠 *ML Model Stats*\n\n"
-                f"├ Samples:   {n} ({ml_mode})\n├ Wins:      {wins}/{n}\n"
-                f"├ Win rate:  {wins/n:.0%}\n├ Precision: {prec:.0%}\n└ Recall:    {rec:.0%}\n\n"
-                f"*Top Features:*\n" + "\n".join([f"  {nm}: {v:.1%}" for nm,v in top]),
-                parse_mode="Markdown", reply_markup=kb_main())
+        wins = sum(state["ml_labels"])
+        if n < 10:
+            await q.edit_message_text(f"🧠 *ML Stats*\n\n⏳ Need {10-n} more samples to train.\nCurrently: {n} samples.",
+                parse_mode="Markdown", reply_markup=kb_main()); return
+        feat_names = ["liquidity","vol24","pc1h","pc6h","pc24h","b1h","s1h","buy_sell_1h",
+                      "age_min","mcap","vol5m","b5m","s5m","buy_sell_5m","liq_mcap","vol_liq",
+                      "buy_size_ratio","hour_utc"]
+        top = []
+        if ml_ready and ml_model:
+            imp = ml_model.feature_importances_
+            top = sorted(zip(feat_names[:len(imp)], imp), key=lambda x: -x[1])[:5]
+        await q.edit_message_text(
+            f"🧠 *ML Model Stats*\n\n"
+            f"├ Samples:    {n} ({wins}W / {n-wins}L)\n"
+            f"├ Status:     {'✅ Ready' if ml_ready else '⏳ Training'}\n"
+            f"├ Win label:  ≥2x multiplier\n\n"
+            f"*Top Features:*\n" + "\n".join([f"  {nm}: {v:.1%}" for nm,v in top]),
+            parse_mode="Markdown", reply_markup=kb_main())
 
     elif data == "settings_menu":
         await q.edit_message_text("⚙️ *Settings*\n\nTap any setting to change it:",
@@ -1464,6 +1630,23 @@ async def _button_handler_inner(update, ctx, q, data):
         await q.edit_message_text(f"📂 *Max Real Positions*\nCurrent: {state['settings'].get('max_real_positions',3)}\n\nSniper stops at this limit.\n_Recommended: 2–5_",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_REAL
 
+    elif data == "set_daily_loss":
+        ctx.user_data["setting"] = "daily_loss_limit_pct"
+        await q.edit_message_text(
+            f"🚨 *Daily Loss Limit*\nCurrent: {state['settings'].get('daily_loss_limit_pct',20)}%\n\n"
+            f"If real P&L drops by this % of your capital in one day,\n"
+            f"the sniper auto-pauses for {state['settings'].get('daily_loss_pause_hrs',4)}h.\n"
+            f"Send a percentage (e.g. `20`):\n_Recommended: 15–25%_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_DAILY_LOSS
+
+    elif data == "set_be_mult":
+        ctx.user_data["setting"] = "breakeven_mult"
+        await q.edit_message_text(
+            f"⚖️ *Breakeven Stop Multiplier*\nCurrent: {state['settings'].get('breakeven_mult',2.0)}x\n\n"
+            f"Once price hits this multiple, stop-loss moves up to entry.\nYou cannot lose on that trade.\n"
+            f"Send a multiplier (e.g. `2.0`):\n_Recommended: 1.5–3.0_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_BE_MULT
+
     elif data == "tiered_trail_menu":
         s = state["settings"]
         await q.edit_message_text(
@@ -1478,7 +1661,7 @@ async def _button_handler_inner(update, ctx, q, data):
             f"├ @ 5x  → sell {s.get('pt_5x_pct',25.0):.0f}% of position\n"
             f"├ @ 10x → sell {s.get('pt_10x_pct',25.0):.0f}% of position\n"
             f"└ @ 20x → sell {s.get('pt_20x_pct',25.0):.0f}% of position\n"
-            f"_(Set any to 0 to disable that milestone)_",
+            f"_(Set any to 0 to disable. Size auto-boosts if sell pressure detected.)_",
             parse_mode="Markdown", reply_markup=kb_tiered_trail())
 
     elif data == "set_trail_5x":
@@ -1523,7 +1706,34 @@ async def _button_handler_inner(update, ctx, q, data):
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PT_20X
 
     elif data == "noop":
-        pass  # separator button — do nothing
+        pass
+
+    elif data == "health":
+        err_txt = "\n".join([f"  [{e['time']}] {e['context']}: {e['error']}" for e in state["errors"][-5:]]) or "  None"
+        st = state["api_stats"]
+        await q.edit_message_text(
+            f"🏥 *Bot Health*\n\n"
+            f"*API Stats:*\n"
+            f"├ Price:   {st['price_ok']}✅ {st['price_fail']}❌\n"
+            f"├ Quote:   {st['quote_ok']}✅ {st['quote_fail']}❌\n"
+            f"├ Swap:    {st['swap_ok']}✅ {st['swap_fail']}❌\n"
+            f"└ Confirm: {st['confirm_ok']}✅ timeout={st['confirm_timeout']}\n\n"
+            f"*State:*\n"
+            f"├ Positions: {len(state['positions'])} real / {len(state['demo_positions'])} demo\n"
+            f"├ ML: {len(state['ml_features'])} samples | {'Ready' if ml_ready else 'Training'}\n"
+            f"├ Daily P&L: ${state['daily_pnl']:+.2f}\n"
+            f"└ DB: {'✅ Connected' if db_pool else '❌ Disconnected'}\n\n"
+            f"*Recent Errors:*\n{err_txt}",
+            parse_mode="Markdown", reply_markup=kb_main())
+
+    elif data == "history":
+        if not state["trades_history"]:
+            await q.edit_message_text("📭 No history yet.", reply_markup=kb_main())
+        else:
+            lines = [f"{'✅' if t['net_pnl']>0 else '❌'} {t['symbol']} | {t['mult']:.2f}x | ${t['net_pnl']:+.2f}"
+                     for t in state["trades_history"][-10:]]
+            await q.edit_message_text("*📜 Last 10 Trades*\n\n" + "\n".join(lines),
+                parse_mode="Markdown", reply_markup=kb_main())
 
     elif data == "buy_prompt":
         ctx.user_data["action"] = "buy"
@@ -1589,64 +1799,11 @@ async def _button_handler_inner(update, ctx, q, data):
         if mint not in state["demo_positions"]:
             await q.edit_message_text("❌ Demo position not found.", reply_markup=kb_main()); return
         pos   = state["demo_positions"][mint]
-        price = await get_token_price(mint) or pos["entry_price"]
-        await q.edit_message_text(f"✂️ Taking profit on {pos['symbol']}...", parse_mode="Markdown")
-        await _close_position(app, mint, pos, price, "✂️ Manual Take Profit", True)
-        await q.edit_message_text(await build_dashboard(), parse_mode="Markdown", reply_markup=kb_main())
-
-    elif data.startswith("confirm_buy:"):
-        parts  = data.split(":"); mint, symbol = parts[1], parts[2]
-        amt    = state["settings"]["trade_amount"]; fees = calc_fees(amt)
-        await q.edit_message_text(f"⏳ Buying {symbol}...", parse_mode="Markdown")
-        price  = await get_token_price(mint)
+        price = await get_token_price(mint)
         if price <= 0:
-            await q.edit_message_text("❌ Price unavailable.", reply_markup=kb_main()); return
-        result = await execute_buy(mint, amt)
-        if not result:
-            await q.edit_message_text("❌ Buy failed. Check USDC balance or increase slippage.", reply_markup=kb_main()); return
-        td  = await get_token_data(mint)
-        pos = {"symbol": symbol, "entry_price": price, "current_price": price, "peak_price": price,
-               "amount_usd": amt-fees["total"], "token_amount": result["out_amount"],
-               "fees_paid": fees["total"], "tp_hit": False,
-               "features": extract_features(td) if td else [0.0]*16, "auto": False}
-        state["positions"][mint] = pos; await db_save_position(mint, pos, False)
-        await q.edit_message_text(await build_dashboard() + f"\n\n✅ *Bought {symbol} @ ${price:.6f}*\n"
-            f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})",
-            parse_mode="Markdown", reply_markup=kb_main(), disable_web_page_preview=True)
-
-    elif data == "confirm_buy_pending":
-        await handle_confirm_buy(update, ctx)
-
-    elif data == "health":
-        a  = state["api_stats"]
-        pt = a["price_ok"]+a["price_fail"]; qt = a["quote_ok"]+a["quote_fail"]; st = a["swap_ok"]+a["swap_fail"]
-        err_txt = "\n".join([f"  [{e['time']}] {e['context']}: {e['error']}" for e in state["errors"][-3:]]) or "  None ✅"
-        s = state["settings"]
-        await q.edit_message_text(
-            f"🏥 *Health*\n\n*API Rates:*\n"
-            f"├ Price: {a['price_ok']}/{pt} ({a['price_ok']/max(pt,1):.0%})\n"
-            f"├ Quote: {a['quote_ok']}/{qt} ({a['quote_ok']/max(qt,1):.0%})\n"
-            f"├ Swap:  {a['swap_ok']}/{st} ({a['swap_ok']/max(st,1):.0%})\n"
-            f"├ Confirm: {a['confirm_ok']} ok | {a['confirm_timeout']} timeout\n\n"
-            f"*Filters:*\n"
-            f"├ Min Age: {s.get('min_token_age_sec',120)}s\n"
-            f"├ Vol5m:   ≥{s.get('min_vol5m_pct',10)}% of liq\n"
-            f"├ Max Pos: {s.get('max_demo_positions',5)}D / {s.get('max_real_positions',3)}R\n\n"
-            f"*State:*\n"
-            f"├ Positions: {len(state['positions'])} real / {len(state['demo_positions'])} demo\n"
-            f"├ ML: {len(state['ml_features'])} samples | {'Ready' if ml_ready else 'Training'}\n"
-            f"└ DB: {'✅ Connected' if db_pool else '❌ Disconnected'}\n\n"
-            f"*Recent Errors:*\n{err_txt}",
-            parse_mode="Markdown", reply_markup=kb_main())
-
-    elif data == "history":
-        if not state["trades_history"]:
-            await q.edit_message_text("📭 No history yet.", reply_markup=kb_main())
-        else:
-            lines = [f"{'✅' if t['net_pnl']>0 else '❌'} {t['symbol']} | {t['mult']:.2f}x | ${t['net_pnl']:+.2f}"
-                     for t in state["trades_history"][-10:]]
-            await q.edit_message_text("*📜 Last 10 Trades*\n\n" + "\n".join(lines),
-                parse_mode="Markdown", reply_markup=kb_main())
+            await q.edit_message_text("❌ Price unavailable, try again.", reply_markup=kb_main()); return
+        await _close_position(app, mint, pos, price, "✂️ Manual TP Close", True)
+        await q.edit_message_text(await build_dashboard(), parse_mode="Markdown", reply_markup=kb_main())
 
 # ============================================================
 # MESSAGE HANDLERS
@@ -1655,7 +1812,9 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = ctx.user_data.get("setting"); txt = update.message.text.strip()
     try:
         val = float(txt)
-        state["settings"][key] = int(val) if key in ("slippage_bps","max_demo_positions","max_real_positions","min_token_age_sec") else val
+        state["settings"][key] = int(val) if key in (
+            "slippage_bps","max_demo_positions","max_real_positions","min_token_age_sec"
+        ) else val
         await db_save_settings()
         await update.message.reply_text(f"✅ *{key.replace('_',' ').title()}* updated to `{txt}`",
             parse_mode="Markdown", reply_markup=kb_main())
@@ -1704,7 +1863,6 @@ async def handle_confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"⏳ {'[DEMO] ' if is_demo else ''}Buying {symbol}...", parse_mode="Markdown")
     price = await get_token_price(mint)
     if price <= 0 and is_demo:
-        # Demo trades need a real entry price; real trades proceed via Jupiter quote
         await q.edit_message_text("❌ Price unavailable for demo trade. Try again.", reply_markup=kb_main())
         return ConversationHandler.END
     if is_demo:
@@ -1712,7 +1870,8 @@ async def handle_confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pos = {"symbol": symbol, "entry_price": price, "current_price": price, "peak_price": price,
                "amount_usd": amt-fees["total"], "token_amount": (amt-fees["total"])/price,
                "fees_paid": fees["total"], "tp_hit": False,
-               "features": extract_features(td) if td else [0.0]*16, "auto": False}
+               "features": extract_features(td) if td else [0.0]*18, "auto": False,
+               "entry_time": time.time(), "peak_vol5m": 0.0}
         state["demo_positions"][mint] = pos; await db_save_position(mint, pos, True)
         await q.edit_message_text(await build_dashboard() + f"\n\n📝 *[DEMO] Bought {symbol} @ ${price:.6f}*",
             parse_mode="Markdown", reply_markup=kb_main())
@@ -1726,7 +1885,8 @@ async def handle_confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pos = {"symbol": symbol, "entry_price": price, "current_price": price, "peak_price": price,
                "amount_usd": amt-fees["total"], "token_amount": result["out_amount"],
                "fees_paid": fees["total"], "tp_hit": False,
-               "features": extract_features(td) if td else [0.0]*16, "auto": False}
+               "features": extract_features(td) if td else [0.0]*18, "auto": False,
+               "entry_time": time.time(), "peak_vol5m": 0.0}
         state["positions"][mint] = pos; await db_save_position(mint, pos, False)
         await q.edit_message_text(await build_dashboard() + f"\n\n✅ *Bought {symbol} @ ${price:.6f}*\n"
             f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})",
@@ -1784,6 +1944,9 @@ def main():
             WAITING_SET_PT_5X:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PT_10X:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PT_20X:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_DAILY_LOSS:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_CONV_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_BE_MULT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
