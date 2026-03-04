@@ -75,6 +75,8 @@ WAITING_SET_TRAIL     = 11
 WAITING_SET_STOP      = 12
 WAITING_SET_AMOUNT    = 13
 WAITING_SET_SLIP      = 14
+WAITING_SET_ENTRY_SLIP = 36
+WAITING_SET_EXIT_SLIP  = 37
 WAITING_SET_SCORE     = 15
 WAITING_SET_LIQ       = 16
 WAITING_SET_RUGCHECK  = 17
@@ -127,6 +129,8 @@ state = {
         "trade_amount": 10.0,
         "demo_trade_amount": 100.0,
         "slippage_bps": 100,
+        "entry_slippage_bps": 100,
+        "exit_slippage_bps": 200,   # higher on exit — better fill when selling fast
         "priority_fee": 20000,
         # Bot modes
         "auto_snipe": False,
@@ -666,7 +670,7 @@ async def confirm_tx(sig):
     state["api_stats"]["confirm_timeout"] += 1; return False
 
 async def execute_buy(mint, amt):
-    q = await get_quote(USDC_MINT, mint, int(amt*1e6), state["settings"]["slippage_bps"])
+    q = await get_quote(USDC_MINT, mint, int(amt*1e6), state["settings"].get("entry_slippage_bps", state["settings"]["slippage_bps"]))
     if not q: return None
     tx = await get_swap_tx(q, state["settings"]["priority_fee"])
     if not tx: return None
@@ -676,7 +680,7 @@ async def execute_buy(mint, amt):
 
 async def execute_sell(mint, token_amt):
     if token_amt <= 0: return None
-    q = await get_quote(mint, USDC_MINT, token_amt, state["settings"]["slippage_bps"])
+    q = await get_quote(mint, USDC_MINT, token_amt, state["settings"].get("exit_slippage_bps", state["settings"]["slippage_bps"]))
     if not q: return None
     tx = await get_swap_tx(q, state["settings"]["priority_fee"])
     if not tx: return None
@@ -714,8 +718,9 @@ def kb_settings():
          InlineKeyboardButton(f"📉 Trailing: {s['trailing_stop']}%",           callback_data="set_trail")],
         [InlineKeyboardButton(f"🛑 Stop Loss: {s['stop_loss']}x",              callback_data="set_stop"),
          InlineKeyboardButton(f"💵 Amount: ${s['trade_amount']}",              callback_data="set_amount")],
-        [InlineKeyboardButton(f"⚡ Slippage: {s['slippage_bps']}bps",          callback_data="set_slip"),
-         InlineKeyboardButton(f"🧠 Min Score: {s['min_score']:.0%}",           callback_data="set_score")],
+        [InlineKeyboardButton(f"⚡ Entry Slip: {s.get('entry_slippage_bps',s['slippage_bps'])}bps", callback_data="set_entry_slip"),
+         InlineKeyboardButton(f"⚡ Exit Slip: {s.get('exit_slippage_bps',200)}bps",  callback_data="set_exit_slip")],
+        [InlineKeyboardButton(f"🧠 Min Score: {s['min_score']:.0%}",           callback_data="set_score")],
         [InlineKeyboardButton(f"💧 Min Liq: ${s['min_liquidity']:,.0f}",       callback_data="set_liq"),
          InlineKeyboardButton(f"🛡️ Max Rug: {s['min_rugcheck']}",             callback_data="set_rugcheck")],
         [InlineKeyboardButton(f"⏱ Min Age: {s.get('min_token_age_sec',120)}s", callback_data="set_min_age"),
@@ -1593,6 +1598,26 @@ async def _button_handler_inner(update, ctx, q, data):
         await q.edit_message_text(f"⚡ *Slippage*\nCurrent: {state['settings']['slippage_bps']}bps\n\nSend new bps (100 = 1%):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_SLIP
 
+    elif data == "set_entry_slip":
+        ctx.user_data["setting"] = "entry_slippage_bps"
+        cur = state["settings"].get("entry_slippage_bps", state["settings"]["slippage_bps"])
+        await q.edit_message_text(
+            f"⚡ *Entry Slippage*\nCurrent: {cur}bps\n\n"
+            f"Applied when *buying* a token.\n"
+            f"Lower = less price impact but more failed buys.\n"
+            f"Send new bps (100 = 1%):\n_Recommended: 50–150bps_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_ENTRY_SLIP
+
+    elif data == "set_exit_slip":
+        ctx.user_data["setting"] = "exit_slippage_bps"
+        cur = state["settings"].get("exit_slippage_bps", 200)
+        await q.edit_message_text(
+            f"⚡ *Exit Slippage*\nCurrent: {cur}bps\n\n"
+            f"Applied when *selling* a token.\n"
+            f"Higher = better chance of filling on fast dumps.\n"
+            f"Send new bps (100 = 1%):\n_Recommended: 150–300bps_",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_EXIT_SLIP
+
     elif data == "set_score":
         ctx.user_data["setting"] = "min_score"
         await q.edit_message_text(f"🧠 *Min ML Score*\nCurrent: {state['settings']['min_score']:.0%}\n\nSend a value 0–1 (e.g. `0.5`):\n_Recommended: 0.5–0.7_",
@@ -1876,7 +1901,7 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = ctx.user_data.get("setting"); txt = update.message.text.strip()
     try:
         val = float(txt)
-        state["settings"][key] = int(val) if key in ("slippage_bps","max_demo_positions","max_real_positions","min_token_age_sec") else val
+        state["settings"][key] = int(val) if key in ("slippage_bps","entry_slippage_bps","exit_slippage_bps","max_demo_positions","max_real_positions","min_token_age_sec") else val
         await db_save_settings()
         await update.message.reply_text(f"✅ *{key.replace('_',' ').title()}* updated to `{txt}`",
             parse_mode="Markdown", reply_markup=kb_main())
@@ -1991,6 +2016,8 @@ def main():
             WAITING_SET_STOP:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_AMOUNT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_SLIP:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_ENTRY_SLIP:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_EXIT_SLIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_SCORE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_LIQ:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_RUGCHECK:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
