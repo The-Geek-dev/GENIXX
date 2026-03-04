@@ -10,7 +10,7 @@ import joblib
 import base58
 import asyncpg
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
