@@ -10,7 +10,7 @@ import joblib
 import base58
 import asyncpg
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from datetime import datetime
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -1838,16 +1838,20 @@ async def _button_handler_inner(update, ctx, q, data):
         now_ts = time.time()
         windows = [("1h", 3600), ("3h", 10800), ("6h", 21600), ("8h", 28800), ("24h", 86400)]
 
-        def window_stats(trades, seconds):
+        def window_stats(trades, seconds, include_proj=False):
             cutoff = now_ts - seconds
             t = [x for x in trades if x.get("closed_at", 0) >= cutoff]
             if not t: return "None"
             pnl  = sum(x["net_pnl"] for x in t)
             wins = sum(1 for x in t if x["net_pnl"] > 0)
-            return f"{len(t)} trades ({wins}W/{len(t)-wins}L) *${pnl:+.2f}*"
+            base = f"{len(t)} trades ({wins}W/{len(t)-wins}L) *${pnl:+.2f}*"
+            if include_proj:
+                proj = sum(x.get("projected_real", 0) for x in t)
+                base += f" _(real≈${proj:+.2f})_"
+            return base
 
         real_lines = "\n".join([f"\u251c {lbl}: {window_stats(state['trades_history'], secs)}" for lbl, secs in windows])
-        demo_lines = "\n".join([f"\u251c {lbl}: {window_stats(state['demo_trades'], secs)}" for lbl, secs in windows])
+        demo_lines = "\n".join([f"\u251c {lbl}: {window_stats(state['demo_trades'], secs, include_proj=True)}" for lbl, secs in windows])
 
         await q.edit_message_text(
             f"\U0001f4c8 *P&L Breakdown*\n\n"
