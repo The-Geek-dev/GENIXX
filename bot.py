@@ -250,17 +250,20 @@ async def db_load_trades():
         for r in rows:
             t = dict(r)
             t["features"] = json.loads(t["features"]) if t["features"] else []
+            closed_ts = t["created_at"].timestamp() if t.get("created_at") else 0
             if t["is_demo"]:
                 state["demo_trades"].append({
                     "symbol": t["symbol"], "mult": t["multiplier"],
                     "net_pnl": t["net_pnl"], "reason": t["reason"],
+                    "closed_at": closed_ts,
                     "projected_real": t["net_pnl"] * (
                         state["settings"]["trade_amount"] / state["settings"]["demo_trade_amount"])
                 })
             else:
                 state["trades_history"].append({
                     "symbol": t["symbol"], "mult": t["multiplier"],
-                    "net_pnl": t["net_pnl"], "reason": t["reason"]})
+                    "net_pnl": t["net_pnl"], "reason": t["reason"],
+                    "closed_at": closed_ts})
         for r in await conn.fetch("SELECT SUM(net_pnl) as total,is_demo FROM trades GROUP BY is_demo"):
             if r["is_demo"]: state["demo_total_pnl"] = float(r["total"] or 0)
             else:            state["total_pnl"]       = float(r["total"] or 0)
@@ -465,7 +468,7 @@ async def _safe_notify(app, text):
 # TOKEN DATA & PRICING
 # ============================================================
 _price_cache: dict = {}       # mint -> (timestamp, price)
-_PRICE_CACHE_TTL      = 8.0   # seconds — reuse fresh prices across monitor cycles
+_PRICE_CACHE_TTL      = 7.5   # seconds — reuse fresh prices across monitor cycles
 _PRICE_CACHE_FAIL_TTL = 3.0   # seconds — retry failed mints sooner than successes
 
 _rugcheck_cache: dict = {}    # mint -> (timestamp, result)
@@ -698,7 +701,8 @@ def kb_main():
          InlineKeyboardButton("🧠 ML Stats",    callback_data="mlstats")],
         [InlineKeyboardButton("⚙️ Settings",    callback_data="settings_menu"),
          InlineKeyboardButton("🏥 Health",      callback_data="health")],
-        [InlineKeyboardButton("📜 History",     callback_data="history")],
+        [InlineKeyboardButton("📜 History",       callback_data="history"),
+         InlineKeyboardButton("📈 P&L Breakdown", callback_data="pnl_breakdown")],
     ])
 
 def kb_settings():
@@ -965,13 +969,14 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
     if is_demo:
         state["demo_total_pnl"] += net_pnl
         state["demo_trades"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl, "reason": reason,
+            "closed_at": time.time(),
             "projected_real": net_pnl*(state["settings"]["trade_amount"]/state["settings"]["demo_trade_amount"])})
         del state["demo_positions"][mint]
     else:
         state["total_pnl"] += net_pnl
         _reset_daily_pnl_if_needed()
         state["daily_pnl"] += net_pnl
-        state["trades_history"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl, "reason": reason})
+        state["trades_history"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl, "reason": reason, "closed_at": time.time()})
         del state["positions"][mint]
 
     pfx       = "📝 DEMO " if is_demo else ""
@@ -1334,8 +1339,14 @@ async def monitor_positions(app):
                             await _tiered_profit_take(app, mint, pos, price, milestone, is_demo)
 
                     # ── Live 5m volume tracking (early dump detection) ───────
+                    # Throttled to once per 30s to avoid DexScreener rate-limiting
                     b5m_live = 0.0; s5m_live = 0.0; vol5m_live = 0.0
-                    td = await get_token_data(mint)
+                    now_ts = time.time()
+                    if now_ts - pos.get("_last_td_fetch", 0) >= 5.2:
+                        td = await get_token_data(mint)
+                        if td: pos["_last_td_fetch"] = now_ts
+                    else:
+                        td = None
                     if td:
                         vol5m_live = float(td.get("volume",{}).get("m5",0) or 0)
                         b5m_live   = float(td.get("txns",{}).get("m5",{}).get("buys",0) or 0)
@@ -1821,6 +1832,28 @@ async def _button_handler_inner(update, ctx, q, data):
             f"├ ML: {len(state['ml_features'])} samples | {'Ready' if ml_ready else 'Training'}\n"
             f"└ DB: {'✅ Connected' if db_pool else '❌ Disconnected'}\n\n"
             f"*Recent Errors:*\n{err_txt}",
+            parse_mode="Markdown", reply_markup=kb_main())
+
+    elif data == "pnl_breakdown":
+        now_ts = time.time()
+        windows = [("1h", 3600), ("3h", 10800), ("6h", 21600), ("8h", 28800), ("24h", 86400)]
+
+        def window_stats(trades, seconds):
+            cutoff = now_ts - seconds
+            t = [x for x in trades if x.get("closed_at", 0) >= cutoff]
+            if not t: return "None"
+            pnl  = sum(x["net_pnl"] for x in t)
+            wins = sum(1 for x in t if x["net_pnl"] > 0)
+            return f"{len(t)} trades ({wins}W/{len(t)-wins}L) *${pnl:+.2f}*"
+
+        real_lines = "\n".join([f"\u251c {lbl}: {window_stats(state['trades_history'], secs)}" for lbl, secs in windows])
+        demo_lines = "\n".join([f"\u251c {lbl}: {window_stats(state['demo_trades'], secs)}" for lbl, secs in windows])
+
+        await q.edit_message_text(
+            f"\U0001f4c8 *P&L Breakdown*\n\n"
+            f"*\U0001f4b0 Real Trades:*\n{real_lines}\n\n"
+            f"*\U0001f4dd Demo Trades:*\n{demo_lines}\n\n"
+            f"_Rolling windows from now_",
             parse_mode="Markdown", reply_markup=kb_main())
 
     elif data == "history":
