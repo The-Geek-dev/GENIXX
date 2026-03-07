@@ -818,7 +818,8 @@ def kb_dump_detection():
         [InlineKeyboardButton(f"⚡ Momentum Exit: {s.get('momentum_exit_pct', 1.5)}%",   callback_data="set_momentum_pct")],
         [InlineKeyboardButton(f"📉 Vol Exhaust: {s.get('vol_exhaustion_pct', 50.0):.0f}%", callback_data="set_vol_exhaust")],
         [InlineKeyboardButton(f"🚨 Sell Ratio: {s.get('sell_ratio_flip_threshold',1.2)}x", callback_data="set_sell_ratio")],
-        [InlineKeyboardButton(f"⏸ Stagnation: {s.get('stagnation_pct',2.0)}% / {s.get('stagnation_secs',180)}s", callback_data="set_stagnation_pct")],
+        [InlineKeyboardButton(f"⏸ Stagnation %: {s.get('stagnation_pct',2.0)}%",      callback_data="set_stagnation_pct"),
+         InlineKeyboardButton(f"⏱ Window: {s.get('stagnation_secs',60)}s",             callback_data="set_stagnation_secs")],
         [InlineKeyboardButton(f"⏰ Max Hold: {s.get('max_hold_minutes', 120)}min",         callback_data="set_max_hold")],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
     ])
@@ -1662,7 +1663,7 @@ async def _button_handler_inner(update, ctx, q, data):
             f"├ 1️⃣ Sell Ratio Flip — sells > buys × {s.get('sell_ratio_flip_threshold',1.2)}\n"
             f"├ 2️⃣ Volume Exhaustion — vol5m < {s.get('vol_exhaustion_pct',50):.0f}% of peak\n"
             f"├ 3️⃣ Momentum Drop — price ->{s.get('momentum_exit_pct',1.5)}% in 5 ticks\n"
-            f"└ 4️⃣ Price Stagnation — <{s.get('stagnation_pct',2.0)}% move in {s.get('stagnation_secs',180)}s\n\n"
+            f"└ 4️⃣ Price Stagnation — <{s.get('stagnation_pct',2.0)}% move in {s.get('stagnation_secs',60)}s\n\n"
             f"*Exit threshold:* {s.get('multi_signal_exit_count',2)} of 4 signals\n"
             f"_(1=aggressive, 2=balanced, 3=conservative)_",
             parse_mode="Markdown", reply_markup=kb_dump_detection())
@@ -1728,10 +1729,18 @@ async def _button_handler_inner(update, ctx, q, data):
     elif data == "set_stagnation_pct":
         ctx.user_data["setting"] = "stagnation_pct"
         await q.edit_message_text(
-            f"⏸ *Price Stagnation % Threshold*\nCurrent: {state['settings'].get('stagnation_pct',2.0)}%\n\n"
+            f"⏸ *Stagnation % Threshold*\nCurrent: {state['settings'].get('stagnation_pct',2.0)}%\n\n"
             f"If price hasn't moved more than this % in the observation window, count as a dump signal.\n"
             f"Recommended: 1.5–3.0%\nSend a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_STAGNATION_PCT
+
+    elif data == "set_stagnation_secs":
+        ctx.user_data["setting"] = "stagnation_secs"
+        await q.edit_message_text(
+            f"⏱ *Stagnation Window (seconds)*\nCurrent: {state['settings'].get('stagnation_secs',60)}s\n\n"
+            f"How long to observe price for stagnation before the signal fires.\n"
+            f"Recommended: 45–120s for meme coins\nSend a value in seconds:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_STAGNATION_SECS
 
     elif data == "set_max_hold":
         ctx.user_data["setting"] = "max_hold_minutes"
