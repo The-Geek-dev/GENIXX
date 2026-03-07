@@ -206,7 +206,7 @@ state = {
         # Exit if price hasn't moved more than stagnation_pct% over
         # stagnation_secs seconds (only active after TP is hit).
         "stagnation_pct":  2.0,   # % movement threshold
-        "stagnation_secs": 180,   # observation window in seconds
+        "stagnation_secs": 60,    # observation window in seconds
         # Wallet concentration filter
         "max_wallet_concentration": 40.0,
     },
@@ -813,7 +813,7 @@ def kb_dump_detection():
             f"🎚 Activate @{pre_tp_act}x",
             callback_data="set_pre_tp_trail_act")],
         [InlineKeyboardButton(
-            f"🔢 Signals needed: {s.get('multi_signal_exit_count', 2)}/3",
+            f"🔢 Signals needed: {s.get('multi_signal_exit_count', 2)}/4",
             callback_data="set_multi_signal_cnt")],
         [InlineKeyboardButton(f"⚡ Momentum Exit: {s.get('momentum_exit_pct', 1.5)}%",   callback_data="set_momentum_pct")],
         [InlineKeyboardButton(f"📉 Vol Exhaust: {s.get('vol_exhaustion_pct', 50.0):.0f}%", callback_data="set_vol_exhaust")],
@@ -1699,7 +1699,8 @@ async def _button_handler_inner(update, ctx, q, data):
             f"How many dump signals must fire together before the bot exits.\n"
             f"1 = any single signal (aggressive)\n"
             f"2 = 2-of-4 signals (balanced — recommended)\n"
-            f"3 = 3-of-4 signals (conservative)\n\nSend 1, 2, or 3:",
+            f"3 = 3-of-4 signals (conservative)\n"
+            f"4 = all 4 signals (very conservative)\n\nSend 1, 2, 3, or 4:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MULTI_SIGNAL_CNT
 
     elif data == "set_momentum_pct":
