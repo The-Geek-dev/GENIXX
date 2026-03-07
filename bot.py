@@ -103,6 +103,8 @@ WAITING_SET_PT_EARLY_MULT    = 42
 WAITING_SET_STAGNATION_PCT   = 43
 WAITING_SET_STAGNATION_SECS  = 44
 WAITING_SET_MULTI_SIGNAL_CNT = 45
+WAITING_SET_PRE_TP_TRAIL     = 46  # pre-TP fast trailing stop %
+WAITING_SET_PRE_TP_TRAIL_ACT = 47  # activation threshold (e.g. 1.1x)
 
 def validate_config():
     missing = [k for k, v in {
@@ -183,6 +185,13 @@ state = {
         "conviction_sizing": True,
         "max_hold_minutes": 120,
         "house_money_max_retries": 3,
+        # ── Pre-TP fast trailing stop ─────────────────────────────────────
+        # Independent tight trail active from pre_tp_trail_act_mult (e.g. 1.1x)
+        # up until TP is hit. Catches fast reversals before the slower
+        # multi-signal system can accumulate enough signal votes.
+        # Set pre_tp_trail_pct to 0 to disable.
+        "pre_tp_trail_pct":      3.0,   # % drop from peak that triggers exit
+        "pre_tp_trail_act_mult": 1.1,   # multiplier at which this trail activates
         # ── Multi-signal exit (NEW) ───────────────────────────────────────
         # How many of the 3 dump signals must fire together to force an exit.
         # 1 = any single signal exits  (aggressive)
@@ -793,7 +802,16 @@ def kb_tiered_trail():
 
 def kb_dump_detection():
     s = state["settings"]
+    pre_tp_pct  = s.get("pre_tp_trail_pct", 3.0)
+    pre_tp_act  = s.get("pre_tp_trail_act_mult", 1.1)
+    pre_tp_lbl  = f"OFF" if pre_tp_pct == 0 else f"{pre_tp_pct}% from peak"
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"⚡ Pre-TP Trail: {pre_tp_lbl} (acts @{pre_tp_act}x)",
+            callback_data="set_pre_tp_trail"),
+         InlineKeyboardButton(
+            f"🎚 Activate @{pre_tp_act}x",
+            callback_data="set_pre_tp_trail_act")],
         [InlineKeyboardButton(
             f"🔢 Signals needed: {s.get('multi_signal_exit_count', 2)}/3",
             callback_data="set_multi_signal_cnt")],
@@ -1378,10 +1396,52 @@ async def monitor_positions(app):
                         if hold_secs > s["max_hold_minutes"] * 60:
                             reason = f"⏰ Max Hold Exit at {mult:.2f}x ({hold_secs/60:.0f}min)"
 
+                    # ── Pre-TP fast trailing stop ────────────────────────────
+                    # Activates as soon as mult >= pre_tp_trail_act_mult (e.g.
+                    # 1.1x) and fires if price then drops pre_tp_trail_pct%
+                    # from its peak. Runs BEFORE TP so it can catch a 1.3x→1.0x
+                    # reversal without waiting for slow multi-signal votes.
+                    # Disabled once TP is hit (post-TP uses tiered trail instead).
+                    elif (not pos.get("tp_hit")
+                            and s.get("pre_tp_trail_pct", 3.0) > 0
+                            and mult >= s.get("pre_tp_trail_act_mult", 1.1)):
+                        pre_tp_pct     = s["pre_tp_trail_pct"] / 100.0
+                        pre_tp_trigger = pos["peak_price"] * (1.0 - pre_tp_pct)
+                        if price <= pre_tp_trigger:
+                            reason = (
+                                f"⚡ Pre-TP Trail Exit at {mult:.2f}x "
+                                f"(dropped {pre_tp_pct:.0%} from {peak_mult:.2f}x peak)"
+                            )
+
+                    # ── TP hit for first time — register BEFORE multi-signal ──
+                    # Must come first in the elif chain so tp_hit is set on the
+                    # same tick that price crosses TP. Multi-signal then runs
+                    # freely on this tick AND all subsequent ticks (via the
+                    # `or pos.get("tp_hit")` condition below).
+                    elif mult >= tp and not pos.get("tp_hit"):
+                        pos["tp_hit"] = True
+                        trail_pct = int(_tiered_trail(mult) * 100)
+                        pfx = "📝 DEMO " if is_demo else ""
+                        if s.get("house_money_mode") and not pos.get("capital_recovered"):
+                            ok = await _partial_sell_for_capital_recovery(app, mint, pos, price, is_demo)
+                            await db_save_position(mint, pos, is_demo)
+                            if not ok:
+                                await _safe_notify(app,
+                                    f"{pfx}🎯 *TP Hit — {pos['symbol']}* {mult:.2f}x\n"
+                                    f"Trailing stop active! 🚀\n_{trail_pct}% tiered trail engaged_")
+                        else:
+                            await db_save_position(mint, pos, is_demo)
+                            await _safe_notify(app,
+                                f"{pfx}🎯 *TP Hit — {pos['symbol']}* {mult:.2f}x\n"
+                                f"Trailing stop active! 🚀\n_{trail_pct}% tiered trail engaged_")
+
                     # ── Multi-signal dump detection (active above 1.1x) ───────
-                    # Previously only ran after TP hit — now runs any time
-                    # the position is in profit above 1.1x to catch reversals
-                    # before they bleed all the way down to stop loss.
+                    # Runs any time the position is in profit above 1.1x, OR
+                    # after TP has been registered (pos["tp_hit"] is True).
+                    # Because the TP-hit branch is now ABOVE this one in the
+                    # elif chain, TP is always recorded on the crossing tick —
+                    # multi-signal then catches dumps on that same tick and all
+                    # subsequent ticks without interfering with TP registration.
                     elif mult >= 1.1 or pos.get("tp_hit"):
                         # ── House Money — trigger as soon as capital is
                         # recoverable (price covers invested + fees).
@@ -1401,7 +1461,7 @@ async def monitor_positions(app):
                                 continue
 
                         # ── Multi-signal dump detection ──────────────────────
-                        # Each of the 3 signals contributes 1 point.
+                        # Each of the 4 signals contributes 1 point.
                         # Exit if total >= multi_signal_exit_count.
                         # This prevents premature exits on single noisy signals.
                         signal_count = 0
@@ -1431,7 +1491,7 @@ async def monitor_positions(app):
                                 signal_count += 1
                                 signal_reasons.append(f"momentum -{momentum_drop:.1%}")
 
-                        # NEW Signal 4: Price stagnation (price barely moved over N seconds)
+                        # Signal 4: Price stagnation (price barely moved over N seconds)
                         stag_pct  = s.get("stagnation_pct", 2.0) / 100
                         stag_secs = s.get("stagnation_secs", 180)
                         hist_full = price_history.get(mint, [])
@@ -1450,24 +1510,6 @@ async def monitor_positions(app):
                             reason = f"🚨 Multi-Signal Exit at {mult:.2f}x [{', '.join(signal_reasons)}]"
                         elif price <= trailing_trigger:
                             reason = f"🟡 Trailing Stop at {mult:.2f}x ({int(post_tp_trail*100)}% trail from {peak_mult:.1f}x peak)"
-
-                    # ── TP hit for first time ────────────────────────────────
-                    elif mult >= tp and not pos.get("tp_hit"):
-                        pos["tp_hit"] = True
-                        trail_pct = int(_tiered_trail(mult) * 100)
-                        pfx = "📝 DEMO " if is_demo else ""
-                        if s.get("house_money_mode") and not pos.get("capital_recovered"):
-                            ok = await _partial_sell_for_capital_recovery(app, mint, pos, price, is_demo)
-                            await db_save_position(mint, pos, is_demo)
-                            if not ok:
-                                await _safe_notify(app,
-                                    f"{pfx}🎯 *TP Hit — {pos['symbol']}* {mult:.2f}x\n"
-                                    f"Trailing stop active! 🚀\n_{trail_pct}% tiered trail engaged_")
-                        else:
-                            await db_save_position(mint, pos, is_demo)
-                            await _safe_notify(app,
-                                f"{pfx}🎯 *TP Hit — {pos['symbol']}* {mult:.2f}x\n"
-                                f"Trailing stop active! 🚀\n_{trail_pct}% tiered trail engaged_")
 
                     if reason:
                         price_history.pop(mint, None)
@@ -1624,6 +1666,31 @@ async def _button_handler_inner(update, ctx, q, data):
             f"*Exit threshold:* {s.get('multi_signal_exit_count',2)} of 4 signals\n"
             f"_(1=aggressive, 2=balanced, 3=conservative)_",
             parse_mode="Markdown", reply_markup=kb_dump_detection())
+
+    elif data == "set_pre_tp_trail":
+        ctx.user_data["setting"] = "pre_tp_trail_pct"
+        s = state["settings"]
+        await q.edit_message_text(
+            f"⚡ *Pre-TP Fast Trailing Stop*\n\n"
+            f"Current: {s.get('pre_tp_trail_pct', 3.0)}% drop from peak\n"
+            f"Activates at: {s.get('pre_tp_trail_act_mult', 1.1)}x\n\n"
+            f"Once price rises above the activation multiplier, this trail locks in.\n"
+            f"If price then drops this % from its peak, the bot sells immediately —\n"
+            f"*before* waiting for multi-signal votes.\n\n"
+            f"Example: peak=1.3x, trail=3% → exits at 1.26x\n\n"
+            f"Set to *0* to disable. Recommended: 2–5%\nSend a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRE_TP_TRAIL
+
+    elif data == "set_pre_tp_trail_act":
+        ctx.user_data["setting"] = "pre_tp_trail_act_mult"
+        s = state["settings"]
+        await q.edit_message_text(
+            f"⚡ *Pre-TP Trail Activation Multiplier*\n\n"
+            f"Current: {s.get('pre_tp_trail_act_mult', 1.1)}x\n\n"
+            f"The pre-TP trailing stop only arms itself once price reaches this multiple.\n"
+            f"Prevents the trail from firing on normal early noise.\n\n"
+            f"Recommended: 1.05–1.2x\nSend a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRE_TP_TRAIL_ACT
 
     elif data == "set_multi_signal_cnt":
         ctx.user_data["setting"] = "multi_signal_exit_count"
@@ -2213,6 +2280,8 @@ def main():
             WAITING_SET_STAGNATION_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_STAGNATION_SECS:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MULTI_SIGNAL_CNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRE_TP_TRAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRE_TP_TRAIL_ACT:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
