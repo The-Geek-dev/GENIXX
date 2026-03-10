@@ -105,6 +105,7 @@ WAITING_SET_STAGNATION_SECS  = 44
 WAITING_SET_MULTI_SIGNAL_CNT = 45
 WAITING_SET_PRE_TP_TRAIL     = 46  # pre-TP fast trailing stop %
 WAITING_SET_PRE_TP_TRAIL_ACT = 47  # activation threshold (e.g. 1.1x)
+WAITING_SET_PRIORITY_FEE     = 48  # priority fee in microlamports
 
 def validate_config():
     missing = [k for k, v in {
@@ -768,6 +769,7 @@ def kb_settings():
          InlineKeyboardButton(f"💵 Amount: ${s['trade_amount']}",              callback_data="set_amount")],
         [InlineKeyboardButton(f"⚡ Entry Slip: {s.get('entry_slippage_bps',s['slippage_bps'])}bps", callback_data="set_entry_slip"),
          InlineKeyboardButton(f"⚡ Exit Slip: {s.get('exit_slippage_bps',200)}bps",  callback_data="set_exit_slip")],
+        [InlineKeyboardButton(f"🚀 Priority Fee: {s.get('priority_fee',20000):,} μL", callback_data="set_priority_fee")],
         [InlineKeyboardButton(f"🧠 Min Score: {s['min_score']:.0%}",           callback_data="set_score")],
         [InlineKeyboardButton(f"💧 Min Liq: ${s['min_liquidity']:,.0f}",       callback_data="set_liq"),
          InlineKeyboardButton(f"🛡️ Max Rug: {s['min_rugcheck']}",             callback_data="set_rugcheck")],
@@ -1816,6 +1818,23 @@ async def _button_handler_inner(update, ctx, q, data):
         await q.edit_message_text(f"⚡ *Exit Slippage*\nCurrent: {cur}bps\n\nSend new bps (100 = 1%):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_EXIT_SLIP
 
+    elif data == "set_priority_fee":
+        ctx.user_data["setting"] = "priority_fee"
+        cur = state["settings"].get("priority_fee", 20000)
+        sol_cost = round((cur / 1e9) * 150.0, 6)
+        await q.edit_message_text(
+            f"🚀 *Priority Fee*\n\n"
+            f"Current: `{cur:,}` microlamports (~${sol_cost:.5f} per tx)\n\n"
+            f"This fee is added to every buy and sell transaction to give it "
+            f"priority treatment in the Solana validator queue.\n\n"
+            f"*Presets:*\n"
+            f"├ Low     →  `10,000` μL  (slow, cheapest)\n"
+            f"├ Medium  →  `20,000` μL  (default)\n"
+            f"├ High    →  `50,000` μL  (faster confirmation)\n"
+            f"└ Turbo   → `200,000` μL  (near-instant, costs more)\n\n"
+            f"Send a custom value in microlamports:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRIORITY_FEE
+
     elif data == "set_score":
         ctx.user_data["setting"] = "min_score"
         await q.edit_message_text(f"🧠 *Min ML Score*\nCurrent: {state['settings']['min_score']:.0%}\n\nSend 0–1 (e.g. 0.65):",
@@ -2073,7 +2092,8 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         val = float(txt)
         int_keys = ("slippage_bps","entry_slippage_bps","exit_slippage_bps",
                     "max_demo_positions","max_real_positions","min_token_age_sec",
-                    "max_hold_minutes","multi_signal_exit_count","stagnation_secs")
+                    "max_hold_minutes","multi_signal_exit_count","stagnation_secs",
+                    "priority_fee")
         state["settings"][key] = int(val) if key in int_keys else val
         await db_save_settings()
         await update.message.reply_text(f"✅ *{key.replace('_',' ').title()}* updated to `{txt}`",
@@ -2292,6 +2312,7 @@ def main():
             WAITING_SET_MULTI_SIGNAL_CNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRE_TP_TRAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRE_TP_TRAIL_ACT:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRIORITY_FEE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
