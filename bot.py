@@ -119,6 +119,19 @@ def validate_config():
 
 keypair = solana_client = db_pool = None
 
+# ── Shared persistent HTTP session (avoids per-call connection overhead) ──────
+_http_session: aiohttp.ClientSession | None = None
+
+async def _get_session() -> aiohttp.ClientSession:
+    """Return a long-lived shared aiohttp session, creating/recreating as needed."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        timeout   = aiohttp.ClientTimeout(total=8, connect=3, sock_read=5)
+        connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300, force_close=False)
+        _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        log.info("Shared HTTP session created")
+    return _http_session
+
 # ============================================================
 # STATE
 # ============================================================
@@ -510,6 +523,16 @@ _rugcheck_cache: dict = {}
 _RUGCHECK_CACHE_TTL   = 300
 
 async def get_token_price(mint: str, pair_data: dict = None) -> float:
+    """
+    Fetch token price with a 4-source fallback chain for maximum reliability.
+    Sources tried in order:
+      1. Caller-supplied pair_data  (free, instant)
+      2. Jupiter Price API v2       (primary live source)
+      3. DexScreener                (independent fallback)
+      4. Jupiter Quote API          (derive price from tiny swap quote)
+    Returns 0.0 only when all sources fail.
+    """
+    # Fast path: caller already has fresh pair data (e.g. from sniper loop)
     if pair_data:
         try:
             price = float(pair_data.get("priceUsd", 0) or 0)
@@ -519,68 +542,106 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                 return price
         except Exception:
             pass
+
     now = time.time()
+    # Short-circuit on fresh cached value
     if mint in _price_cache:
         ts, p = _price_cache[mint]
-        if p > 0 and now - ts < _PRICE_CACHE_TTL: return p
+        if p > 0 and now - ts < _PRICE_CACHE_TTL:     return p
         if p == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL: return 0.0
+
+    sess = await _get_session()
+    _T5  = aiohttp.ClientTimeout(total=5)
+
+    # ── Source 1: Jupiter Price API v2 ───────────────────────────────────────
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-            async with s.get(f"{DEXSCREENER_API}{mint}") as r:
-                if r.status == 200:
-                    pairs = [p for p in ((await r.json()).get("pairs") or []) if p.get("chainId") == "solana"]
-                    if pairs:
-                        pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
-                        price = float(pairs[0].get("priceUsd", 0) or 0)
-                        if price > 0:
-                            state["api_stats"]["price_ok"] += 1
-                            _price_cache[mint] = (now, price); return price
-                elif r.status == 429:
-                    log.warning("DexScreener rate-limited")
-    except Exception as e: log.warning(f"DexScreener price: {e}")
+        async with sess.get(
+            JUPITER_PRICE_API,
+            params={"ids": mint, "showExtraInfo": "false"},
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                raw   = (await r.json()).get("data", {}).get(mint, {}) or {}
+                price = float(raw.get("price") or 0)
+                if price > 0:
+                    state["api_stats"]["price_ok"] += 1
+                    _price_cache[mint] = (now, price)
+                    return price
+    except Exception as e:
+        log.debug(f"price/jup_v2 miss [{mint[:8]}]: {e}")
+
+    # ── Source 2: DexScreener ─────────────────────────────────────────────────
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
-            async with s.get(f"{JUPITER_PRICE_API}?ids={mint}&showExtraInfo=false") as r:
-                if r.status == 200:
-                    raw = (await r.json()).get("data", {}).get(mint, {})
-                    price = float(raw.get("price") or 0)
+        async with sess.get(
+            f"{DEXSCREENER_API}{mint}",
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                pairs = [p for p in ((await r.json()).get("pairs") or []) if p.get("chainId") == "solana"]
+                if pairs:
+                    pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
+                    price = float(pairs[0].get("priceUsd", 0) or 0)
                     if price > 0:
                         state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, price); return price
-    except Exception as e: log.warning(f"Jupiter price API: {e}")
+                        _price_cache[mint] = (now, price)
+                        log.debug(f"price/dexscreener fallback OK [{mint[:8]}]")
+                        return price
+            elif r.status == 429:
+                log.warning("DexScreener rate-limited on price fallback")
+    except Exception as e:
+        log.debug(f"price/dexscreener miss [{mint[:8]}]: {e}")
+
+    # ── Source 3: Jupiter Quote API (derive price from tiny USDC→token quote) ─
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-            async with s.get(JUPITER_QUOTE_API, params={"inputMint": USDC_MINT, "outputMint": mint,
-                    "amount": 1_000_000, "slippageBps": 500}) as r:
-                if r.status == 200:
-                    q = await r.json(); out = int(q.get("outAmount", 0)); decimals = int(q.get("outputDecimals", 6))
-                    if out > 0:
-                        price = 1.0 / (out / (10 ** decimals))
-                        state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, price); return price
-    except Exception as e: log.warning(f"Jupiter quote fallback price: {e}")
+        async with sess.get(
+            JUPITER_QUOTE_API,
+            params={"inputMint": USDC_MINT, "outputMint": mint,
+                    "amount": 1_000_000, "slippageBps": 500},
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                q        = await r.json()
+                out      = int(q.get("outAmount", 0))
+                decimals = int(q.get("outputDecimals", 6))
+                if out > 0:
+                    price = 1.0 / (out / (10 ** decimals))
+                    state["api_stats"]["price_ok"] += 1
+                    _price_cache[mint] = (now, price)
+                    log.debug(f"price/quote_fallback OK [{mint[:8]}]")
+                    return price
+    except Exception as e:
+        log.debug(f"price/quote_fallback miss [{mint[:8]}]: {e}")
+
+    # ── Source 4: GeckoTerminal ───────────────────────────────────────────────
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
-            async with s.get(f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
-                    headers={"Accept": "application/json"}) as r:
-                if r.status == 200:
-                    price = float((await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0)
-                    if price > 0:
-                        state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, price); return price
-    except Exception as e: log.warning(f"GeckoTerminal price: {e}")
+        async with sess.get(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
+            headers={"Accept": "application/json"},
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                price = float((await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0)
+                if price > 0:
+                    state["api_stats"]["price_ok"] += 1
+                    _price_cache[mint] = (now, price)
+                    log.debug(f"price/gecko fallback OK [{mint[:8]}]")
+                    return price
+    except Exception as e:
+        log.debug(f"price/gecko miss [{mint[:8]}]: {e}")
+
     state["api_stats"]["price_fail"] += 1
     _price_cache[mint] = (now, 0.0)
-    log.warning(f"All price sources failed for {mint[:16]}")
+    log.warning(f"price: ALL sources failed for {mint[:8]}")
     return 0.0
+
 
 async def get_token_data(mint):
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.get(DEXSCREENER_API+mint) as r:
-                if r.status != 200: return None
-                pairs = [p for p in (await r.json()).get("pairs",[]) if p.get("chainId")=="solana"]
-                return max(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0)) if pairs else None
+        sess = await _get_session()
+        async with sess.get(DEXSCREENER_API+mint, timeout=aiohttp.ClientTimeout(total=7)) as r:
+            if r.status != 200: return None
+            pairs = [p for p in (await r.json()).get("pairs",[]) if p.get("chainId")=="solana"]
+            return max(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0)) if pairs else None
     except Exception as e:
         log_error("get_token_data", e); return None
 
@@ -655,11 +716,12 @@ async def get_wallet_balance() -> dict:
 # ============================================================
 async def get_quote(in_m, out_m, amt, slippage=100):
     async def _f():
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.get(JUPITER_QUOTE_API,
-                params={"inputMint":in_m,"outputMint":out_m,"amount":amt,"slippageBps":slippage}) as r:
-                if r.status != 200: raise ValueError(f"Quote {r.status}")
-                return await r.json()
+        sess = await _get_session()
+        async with sess.get(JUPITER_QUOTE_API,
+            params={"inputMint":in_m,"outputMint":out_m,"amount":amt,"slippageBps":slippage},
+            timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200: raise ValueError(f"Quote {r.status}")
+            return await r.json()
     try:
         q = await with_retry(_f, label="quote"); state["api_stats"]["quote_ok"] += 1; return q
     except Exception as e:
@@ -1329,6 +1391,10 @@ async def monitor_positions(app):
             for mint, pos in list(pool.items()):
                 try:
                     price = price_map.get(mint, 0.0)
+                    if price <= 0:
+                        # One immediate retry before skipping this tick
+                        await asyncio.sleep(0.3)
+                        price = await get_token_price(mint)
                     if price <= 0: continue
                     pos["current_price"] = price
                     entry = pos["entry_price"]; mult = price / entry
