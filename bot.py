@@ -110,6 +110,7 @@ WAITING_SET_RISKY_SCORE      = 49  # risky token ML threshold
 WAITING_SET_MAX_PUMP_CLEAN   = 50  # max 1h pump % for clean tokens
 WAITING_SET_MAX_PUMP_RISKY   = 51  # max 1h pump % for risky tokens
 WAITING_SET_MAX_TOKEN_AGE    = 52  # max token age in minutes
+WAITING_PNL_CUSTOM_HOURS     = 53  # custom P&L window input
 
 def validate_config():
     missing = [k for k, v in {
@@ -127,6 +128,11 @@ keypair = solana_client = db_pool = None
 _http_session = None
 _source_backoff: dict = {}
 _SOURCE_BACKOFF_SECS = 15
+
+# ── Dead-mint tracker — skip tokens that have failed all 4 price sources ─────
+# Prevents repeated API hammering on rugged/dead tokens between monitor ticks.
+_dead_mints: dict = {}          # mint -> timestamp after which to retry
+_DEAD_MINT_TTL    = 300         # seconds before a dead mint is retried (5 min)
 
 async def _get_session():
     global _http_session
@@ -149,10 +155,16 @@ async def get_token_prices_batch(mints):
     if not mints: return {}
     result = {m: 0.0 for m in mints}
     if not _source_ok("jup_batch"): return result
+    # Skip mints that recently failed all price sources — avoids inflating fail counter
+    now_t      = time.time()
+    live_mints = [m for m in mints if now_t >= _dead_mints.get(m, 0)]
+    if len(live_mints) < len(mints):
+        log.debug(f"batch price: skipping {len(mints)-len(live_mints)} dead mints")
+    if not live_mints: return result
     try:
         sess = await _get_session()
         async with sess.get(JUPITER_PRICE_API,
-                params={"ids": ",".join(mints), "showExtraInfo": "false"},
+                params={"ids": ",".join(live_mints), "showExtraInfo": "false"},
                 timeout=aiohttp.ClientTimeout(total=8)) as r:
             if r.status == 429:
                 _source_backoff_set("jup_batch", 20)
@@ -161,16 +173,20 @@ async def get_token_prices_batch(mints):
             if r.status == 200:
                 data = (await r.json()).get("data", {}) or {}
                 hits = 0
-                for mint in mints:
+                for mint in live_mints:
                     p = float((data.get(mint) or {}).get("price") or 0)
                     if p > 0:
                         result[mint] = p
                         _price_cache[mint] = (time.time(), p)
+                        _dead_mints.pop(mint, None)   # clear dead flag if OK again
                         state["api_stats"]["price_ok"] += 1
                         hits += 1
-                    else:
-                        state["api_stats"]["price_fail"] += 1
-                log.debug(f"batch price: {hits}/{len(mints)} hits")
+                    # NOTE: do NOT increment price_fail here.
+                    # get_token_price() runs a full 4-source fallback chain for
+                    # misses and is the single authoritative place that marks
+                    # price_fail and the dead-mint flag. Counting failures here
+                    # would double-count every batch miss.
+                log.debug(f"batch price: {hits}/{len(live_mints)} hits")
                 return result
     except Exception as e:
         log.warning(f"batch price error: {e}")
@@ -572,7 +588,7 @@ async def _safe_notify(app, text):
 # ============================================================
 _price_cache: dict = {}
 _PRICE_CACHE_TTL      = 7.5
-_PRICE_CACHE_FAIL_TTL = 3.0
+_PRICE_CACHE_FAIL_TTL = 30.0   # was 3.0 — longer cool-down stops hammering dead tokens
 _rugcheck_cache: dict = {}
 _RUGCHECK_CACHE_TTL   = 300
 
@@ -584,7 +600,12 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
       2. Jupiter Price API v2       (primary live source)
       3. DexScreener                (independent fallback)
       4. Jupiter Quote API          (derive price from tiny swap quote)
+      5. GeckoTerminal              (last-resort fallback)
     Returns 0.0 only when all sources fail.
+
+    Dead-mint optimisation: if all sources failed recently, the mint is
+    suppressed for _DEAD_MINT_TTL seconds to avoid burning API quota on
+    rugged/zero-liquidity tokens that will never price successfully.
     """
     # Fast path: caller already has fresh pair data (e.g. from sniper loop)
     if pair_data:
@@ -593,11 +614,17 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
             if price > 0:
                 state["api_stats"]["price_ok"] += 1
                 _price_cache[mint] = (time.time(), price)
+                _dead_mints.pop(mint, None)
                 return price
         except Exception:
             pass
 
     now = time.time()
+
+    # Dead-mint fast exit — don't retry until TTL expires
+    if now < _dead_mints.get(mint, 0):
+        return 0.0
+
     # Short-circuit on fresh cached value
     if mint in _price_cache:
         ts, p = _price_cache[mint]
@@ -620,6 +647,7 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                 if price > 0:
                     state["api_stats"]["price_ok"] += 1
                     _price_cache[mint] = (now, price)
+                    _dead_mints.pop(mint, None)
                     return price
     except Exception as e:
         log.debug(f"price/jup_v2 miss [{mint[:8]}]: {e}")
@@ -638,6 +666,7 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                     if price > 0:
                         state["api_stats"]["price_ok"] += 1
                         _price_cache[mint] = (now, price)
+                        _dead_mints.pop(mint, None)
                         log.debug(f"price/dexscreener fallback OK [{mint[:8]}]")
                         return price
             elif r.status == 429:
@@ -661,6 +690,7 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                     price = 1.0 / (out / (10 ** decimals))
                     state["api_stats"]["price_ok"] += 1
                     _price_cache[mint] = (now, price)
+                    _dead_mints.pop(mint, None)
                     log.debug(f"price/quote_fallback OK [{mint[:8]}]")
                     return price
     except Exception as e:
@@ -678,14 +708,19 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                 if price > 0:
                     state["api_stats"]["price_ok"] += 1
                     _price_cache[mint] = (now, price)
+                    _dead_mints.pop(mint, None)   # recovered — clear dead flag
                     log.debug(f"price/gecko fallback OK [{mint[:8]}]")
                     return price
     except Exception as e:
         log.debug(f"price/gecko miss [{mint[:8]}]: {e}")
 
+    # All 4 sources failed — mark mint as dead for _DEAD_MINT_TTL seconds.
+    # This prevents repeated API calls on rugged/zero-liquidity tokens and
+    # keeps the price_fail counter from inflating on every monitor tick.
     state["api_stats"]["price_fail"] += 1
     _price_cache[mint] = (now, 0.0)
-    log.warning(f"price: ALL sources failed for {mint[:8]}")
+    _dead_mints[mint]  = now + _DEAD_MINT_TTL
+    log.warning(f"price: ALL sources failed for {mint[:8]} — suppressed {_DEAD_MINT_TTL}s")
     return 0.0
 
 
@@ -871,6 +906,7 @@ def kb_main():
          InlineKeyboardButton("🏥 Health",      callback_data="health")],
         [InlineKeyboardButton("📜 History",       callback_data="history"),
          InlineKeyboardButton("📈 P&L Breakdown", callback_data="pnl_breakdown")],
+        [InlineKeyboardButton("🔎 Custom P&L Window", callback_data="pnl_custom_prompt")],
         [InlineKeyboardButton("💼 My Wallet",   callback_data="wallet")],
     ])
 
@@ -2265,13 +2301,15 @@ async def _button_handler_inner(update, ctx, q, data):
         now_t = time.time()
         def ss(n): return "✅" if now_t >= _source_backoff.get(n,0) else "⏸"
         score_warn = " ⚠️ LOW!" if state["settings"].get("min_score",0.65) < 0.50 else ""
+        dead_count = sum(1 for exp in _dead_mints.values() if now_t < exp)
         await q.edit_message_text(
             f"🏥 *Health*\n\n*API Rates:*\n"
             f"├ Price: {a['price_ok']}/{pt} ({a['price_ok']/max(pt,1):.0%})\n"
             f"├ Quote: {a['quote_ok']}/{qt} ({a['quote_ok']/max(qt,1):.0%})\n"
             f"├ Swap:  {a['swap_ok']}/{st} ({a['swap_ok']/max(st,1):.0%})\n"
             f"├ Confirm: {a['confirm_ok']} ok | {a['confirm_timeout']} timeout\n"
-            f"├ RPC Reconnects: {a.get('rpc_reconnects',0)}\n\n"
+            f"├ RPC Reconnects: {a.get('rpc_reconnects',0)}\n"
+            f"└ Dead mints suppressed: {dead_count}\n\n"
             f"*Price Sources:*\n"
             f"├ Jup Batch:{ss('jup_batch')} Jup v2:{ss('jup_v2')} DexScreener:{ss('dexscreener')}\n"
             f"└ Jup Quote:{ss('jup_quote')} GeckoTerminal:{ss('gecko')}\n\n"
@@ -2289,6 +2327,7 @@ async def _button_handler_inner(update, ctx, q, data):
     elif data == "pnl_breakdown":
         now_ts = time.time()
         windows = [("1h", 3600), ("3h", 10800), ("6h", 21600), ("8h", 28800), ("24h", 86400)]
+
         def window_stats(trades, seconds, include_proj=False):
             cutoff = now_ts - seconds
             t = [x for x in trades if x.get("closed_at", 0) >= cutoff]
@@ -2300,11 +2339,22 @@ async def _button_handler_inner(update, ctx, q, data):
                 proj = sum(x.get("projected_real", 0) for x in t)
                 base += f" _(real≈${proj:+.2f})_"
             return base
+
         real_lines = "\n".join([f"├ {lbl}: {window_stats(state['trades_history'], secs)}" for lbl, secs in windows])
         demo_lines = "\n".join([f"├ {lbl}: {window_stats(state['demo_trades'], secs, True)}" for lbl, secs in windows])
         await q.edit_message_text(
-            f"📈 *P&L Breakdown*\n\n*💰 Real:*\n{real_lines}\n\n*📝 Demo:*\n{demo_lines}",
+            f"📈 *P&L Breakdown*\n\n*💰 Real:*\n{real_lines}\n\n*📝 Demo:*\n{demo_lines}\n\n"
+            f"_Tap 🔎 Custom P&L Window on the menu for a custom time range._",
             parse_mode="Markdown", reply_markup=kb_main())
+
+    elif data == "pnl_custom_prompt":
+        await q.edit_message_text(
+            "🔎 *Custom P&L Window*\n\n"
+            "Send the number of hours you want to analyse.\n"
+            "Examples: `4` → last 4h  |  `0.5` → last 30min  |  `48` → last 2 days\n\n"
+            "_Decimals are supported._",
+            parse_mode="Markdown", reply_markup=kb_back())
+        return WAITING_PNL_CUSTOM_HOURS
 
     elif data == "history":
         if not state["trades_history"]:
@@ -2332,6 +2382,78 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=kb_main())
     except ValueError:
         await update.message.reply_text("❌ Invalid value. Send a number.", reply_markup=kb_main())
+    return ConversationHandler.END
+
+async def handle_pnl_custom_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle custom P&L window input — shows full stats + best/worst trades."""
+    txt = update.message.text.strip()
+    try:
+        hours = float(txt)
+        if hours <= 0: raise ValueError("must be positive")
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid input. Send a positive number of hours (e.g. `4` or `0.5`).",
+            parse_mode="Markdown", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    seconds  = hours * 3600
+    now_ts   = time.time()
+    cutoff   = now_ts - seconds
+
+    # Format label — e.g. "30min" or "4h" or "2.5h"
+    if hours < 1:
+        lbl = f"{int(hours*60)}min"
+    elif hours == int(hours):
+        lbl = f"{int(hours)}h"
+    else:
+        lbl = f"{hours:.1f}h"
+
+    def _analyse(trades, include_proj=False):
+        t = [x for x in trades if x.get("closed_at", 0) >= cutoff]
+        if not t:
+            return {"count": 0, "wins": 0, "losses": 0, "pnl": 0.0,
+                    "best": None, "worst": None, "proj": 0.0, "trades": []}
+        pnl    = sum(x["net_pnl"] for x in t)
+        wins   = [x for x in t if x["net_pnl"] > 0]
+        losses = [x for x in t if x["net_pnl"] <= 0]
+        best   = max(t, key=lambda x: x["net_pnl"])
+        worst  = min(t, key=lambda x: x["net_pnl"])
+        proj   = sum(x.get("projected_real", 0) for x in t) if include_proj else 0.0
+        return {"count": len(t), "wins": len(wins), "losses": len(losses),
+                "pnl": pnl, "best": best, "worst": worst, "proj": proj, "trades": t}
+
+    real = _analyse(state["trades_history"])
+    demo = _analyse(state["demo_trades"], include_proj=True)
+
+    def _trade_line(t):
+        if not t: return "  None"
+        icon = "✅" if t["net_pnl"] > 0 else "❌"
+        return f"  {icon} *{escape_md(t['symbol'])}* | {t.get('mult',0):.2f}x | *${t['net_pnl']:+.2f}*"
+
+    def _section(label, r, include_proj=False):
+        if r["count"] == 0:
+            return f"*{label}* — No trades in this window"
+        win_rate = r["wins"] / r["count"] if r["count"] > 0 else 0
+        lines = [
+            f"*{label}*",
+            f"├ Trades:   {r['count']} ({r['wins']}W / {r['losses']}L)",
+            f"├ Win rate: {win_rate:.0%}",
+            f"├ Net P&L:  *${r['pnl']:+.2f}*",
+        ]
+        if include_proj and r["proj"] != 0:
+            lines.append(f"├ Real proj: _{r['proj']:+.2f}_")
+        lines += [
+            f"├ Best:     {_trade_line(r['best'])}",
+            f"└ Worst:    {_trade_line(r['worst'])}",
+        ]
+        return "\n".join(lines)
+
+    msg = (
+        f"🔎 *Custom P&L — Last {lbl}*\n{'─'*26}\n\n"
+        f"{_section('💰 Real', real)}\n\n"
+        f"{_section('📝 Demo', demo, include_proj=True)}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb_main())
     return ConversationHandler.END
 
 async def handle_buy_mint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2549,6 +2671,7 @@ def main():
             WAITING_SET_MAX_PUMP_CLEAN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_PUMP_RISKY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_TOKEN_AGE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_PNL_CUSTOM_HOURS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pnl_custom_hours)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
