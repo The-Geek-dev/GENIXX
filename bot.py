@@ -106,11 +106,6 @@ WAITING_SET_MULTI_SIGNAL_CNT = 45
 WAITING_SET_PRE_TP_TRAIL     = 46  # pre-TP fast trailing stop %
 WAITING_SET_PRE_TP_TRAIL_ACT = 47  # activation threshold (e.g. 1.1x)
 WAITING_SET_PRIORITY_FEE     = 48  # priority fee in microlamports
-WAITING_SET_RISKY_SCORE      = 49  # ML threshold for risky tokens
-WAITING_SET_MAX_PUMP_CLEAN   = 50  # max 1h price change % for clean tokens
-WAITING_SET_MAX_PUMP_RISKY   = 51  # max 1h price change % for risky tokens
-WAITING_SET_MAX_TOKEN_AGE    = 52  # max token age in minutes
-WAITING_SET_PRIORITY_FEE     = 48  # priority fee in microlamports
 
 def validate_config():
     missing = [k for k, v in {
@@ -124,7 +119,7 @@ def validate_config():
 
 keypair = solana_client = db_pool = None
 
-# ── Shared HTTP session ───────────────────────────────────────────
+# ── Shared HTTP session + price source backoff ───────────────────────────────
 _http_session = None
 _source_backoff: dict = {}
 _SOURCE_BACKOFF_SECS = 15
@@ -146,15 +141,15 @@ def _source_backoff_set(name, secs=None):
     _source_backoff[name] = time.time() + (secs or _SOURCE_BACKOFF_SECS)
 
 async def get_token_prices_batch(mints):
-    """Fetch prices for ALL mints in one Jupiter API call."""
+    """Fetch prices for ALL mints in ONE Jupiter API call — reduces rate limit hits."""
     if not mints: return {}
     result = {m: 0.0 for m in mints}
     if not _source_ok("jup_batch"): return result
     try:
         sess = await _get_session()
         async with sess.get(JUPITER_PRICE_API,
-            params={"ids": ",".join(mints), "showExtraInfo": "false"},
-            timeout=aiohttp.ClientTimeout(total=8)) as r:
+                params={"ids": ",".join(mints), "showExtraInfo": "false"},
+                timeout=aiohttp.ClientTimeout(total=8)) as r:
             if r.status == 429:
                 _source_backoff_set("jup_batch", 20)
                 log.warning("Jupiter batch: rate limited 20s")
@@ -177,19 +172,6 @@ async def get_token_prices_batch(mints):
         log.warning(f"batch price error: {e}")
         _source_backoff_set("jup_batch", 5)
     return result
-
-# ── Shared persistent HTTP session (avoids per-call connection overhead) ──────
-_http_session: aiohttp.ClientSession | None = None
-
-async def _get_session() -> aiohttp.ClientSession:
-    """Return a long-lived shared aiohttp session, creating/recreating as needed."""
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        timeout   = aiohttp.ClientTimeout(total=8, connect=3, sock_read=5)
-        connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300, force_close=False)
-        _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-        log.info("Shared HTTP session created")
-    return _http_session
 
 # ============================================================
 # STATE
@@ -225,11 +207,7 @@ state = {
         "ml_real_only": False,
         # Filters
         "min_liquidity": 50000,
-        "min_score": 0.65,
-        "risky_min_score": 0.70,
-        "max_pump_pct_clean": 150.0,
-        "max_pump_pct_risky": 80.0,
-        "max_token_age_min": 0,
+        "min_score": 0.5,
         "min_rugcheck": 500,
         "min_token_age_sec": 120,
         "min_vol5m_pct": 10.0,
@@ -333,6 +311,15 @@ async def db_load_settings():
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM settings WHERE key='main'")
         if row: state["settings"].update(json.loads(row["value"]))
+    # Safety floor: prevent dangerously low values from overriding good defaults
+    s = state["settings"]; changed = False
+    if s.get("min_score", 0) < 0.50:
+        log.warning(f"min_score={s['min_score']} below floor — resetting to 0.65")
+        s["min_score"] = 0.65; changed = True
+    for k, v in [("risky_min_score", 0.70), ("max_pump_pct_clean", 150.0),
+                 ("max_pump_pct_risky", 80.0), ("max_token_age_min", 0), ("priority_fee", 20000)]:
+        if k not in s: s[k] = v; changed = True
+    if changed: await db_save_settings()
 
 async def db_save_position(mint, pos, is_demo):
     async with db_pool.acquire() as conn:
@@ -586,95 +573,117 @@ _rugcheck_cache: dict = {}
 _RUGCHECK_CACHE_TTL   = 300
 
 async def get_token_price(mint: str, pair_data: dict = None) -> float:
-    """4-source fallback chain with per-source rate-limit backoff."""
+    """
+    Fetch token price with a 4-source fallback chain for maximum reliability.
+    Sources tried in order:
+      1. Caller-supplied pair_data  (free, instant)
+      2. Jupiter Price API v2       (primary live source)
+      3. DexScreener                (independent fallback)
+      4. Jupiter Quote API          (derive price from tiny swap quote)
+    Returns 0.0 only when all sources fail.
+    """
+    # Fast path: caller already has fresh pair data (e.g. from sniper loop)
     if pair_data:
         try:
-            p = float(pair_data.get("priceUsd", 0) or 0)
-            if p > 0:
+            price = float(pair_data.get("priceUsd", 0) or 0)
+            if price > 0:
                 state["api_stats"]["price_ok"] += 1
-                _price_cache[mint] = (time.time(), p)
-                return p
-        except Exception: pass
+                _price_cache[mint] = (time.time(), price)
+                return price
+        except Exception:
+            pass
+
     now = time.time()
+    # Short-circuit on fresh cached value
     if mint in _price_cache:
         ts, p = _price_cache[mint]
-        if p > 0 and now - ts < _PRICE_CACHE_TTL: return p
+        if p > 0 and now - ts < _PRICE_CACHE_TTL:     return p
         if p == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL: return 0.0
+
     sess = await _get_session()
     _T5  = aiohttp.ClientTimeout(total=5)
-    # Source 1: Jupiter Price API v2
-    if _source_ok("jup_v2"):
-        try:
-            async with sess.get(JUPITER_PRICE_API,
-                params={"ids": mint, "showExtraInfo": "false"}, timeout=_T5) as r:
-                if r.status == 429:
-                    _source_backoff_set("jup_v2", 20)
-                    log.warning("Jupiter v2: rate limited 20s")
-                elif r.status == 200:
-                    raw = (await r.json()).get("data", {}).get(mint, {}) or {}
-                    p   = float(raw.get("price") or 0)
-                    if p > 0:
+
+    # ── Source 1: Jupiter Price API v2 ───────────────────────────────────────
+    try:
+        async with sess.get(
+            JUPITER_PRICE_API,
+            params={"ids": mint, "showExtraInfo": "false"},
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                raw   = (await r.json()).get("data", {}).get(mint, {}) or {}
+                price = float(raw.get("price") or 0)
+                if price > 0:
+                    state["api_stats"]["price_ok"] += 1
+                    _price_cache[mint] = (now, price)
+                    return price
+    except Exception as e:
+        log.debug(f"price/jup_v2 miss [{mint[:8]}]: {e}")
+
+    # ── Source 2: DexScreener ─────────────────────────────────────────────────
+    try:
+        async with sess.get(
+            f"{DEXSCREENER_API}{mint}",
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                pairs = [p for p in ((await r.json()).get("pairs") or []) if p.get("chainId") == "solana"]
+                if pairs:
+                    pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
+                    price = float(pairs[0].get("priceUsd", 0) or 0)
+                    if price > 0:
                         state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, p); return p
-        except Exception as e:
-            log.debug(f"price/jup_v2 [{mint[:8]}]: {e}")
-            _source_backoff_set("jup_v2", 3)
-    # Source 2: DexScreener
-    if _source_ok("dexscreener"):
-        try:
-            async with sess.get(f"{DEXSCREENER_API}{mint}", timeout=_T5) as r:
-                if r.status == 429:
-                    _source_backoff_set("dexscreener", 30)
-                    log.warning("DexScreener: rate limited 30s")
-                elif r.status == 200:
-                    pairs = [x for x in ((await r.json()).get("pairs") or []) if x.get("chainId") == "solana"]
-                    if pairs:
-                        pairs.sort(key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
-                        p = float(pairs[0].get("priceUsd", 0) or 0)
-                        if p > 0:
-                            state["api_stats"]["price_ok"] += 1
-                            _price_cache[mint] = (now, p); return p
-        except Exception as e:
-            log.debug(f"price/dexscreener [{mint[:8]}]: {e}")
-            _source_backoff_set("dexscreener", 3)
-    # Source 3: Jupiter Quote
-    if _source_ok("jup_quote"):
-        try:
-            async with sess.get(JUPITER_QUOTE_API,
-                params={"inputMint": USDC_MINT, "outputMint": mint,
-                        "amount": 1_000_000, "slippageBps": 500}, timeout=_T5) as r:
-                if r.status == 429:
-                    _source_backoff_set("jup_quote", 20)
-                elif r.status == 200:
-                    q = await r.json(); out = int(q.get("outAmount", 0))
-                    decimals = int(q.get("outputDecimals", 6))
-                    if out > 0:
-                        p = 1.0 / (out / (10 ** decimals))
-                        state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, p); return p
-        except Exception as e:
-            log.debug(f"price/jup_quote [{mint[:8]}]: {e}")
-            _source_backoff_set("jup_quote", 3)
-    # Source 4: GeckoTerminal
-    if _source_ok("gecko"):
-        try:
-            async with sess.get(
-                f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
-                headers={"Accept": "application/json"}, timeout=_T5) as r:
-                if r.status == 429:
-                    _source_backoff_set("gecko", 60)
-                elif r.status == 200:
-                    p = float((await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0)
-                    if p > 0:
-                        state["api_stats"]["price_ok"] += 1
-                        _price_cache[mint] = (now, p); return p
-        except Exception as e:
-            log.debug(f"price/gecko [{mint[:8]}]: {e}")
-            _source_backoff_set("gecko", 5)
+                        _price_cache[mint] = (now, price)
+                        log.debug(f"price/dexscreener fallback OK [{mint[:8]}]")
+                        return price
+            elif r.status == 429:
+                log.warning("DexScreener rate-limited on price fallback")
+    except Exception as e:
+        log.debug(f"price/dexscreener miss [{mint[:8]}]: {e}")
+
+    # ── Source 3: Jupiter Quote API (derive price from tiny USDC→token quote) ─
+    try:
+        async with sess.get(
+            JUPITER_QUOTE_API,
+            params={"inputMint": USDC_MINT, "outputMint": mint,
+                    "amount": 1_000_000, "slippageBps": 500},
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                q        = await r.json()
+                out      = int(q.get("outAmount", 0))
+                decimals = int(q.get("outputDecimals", 6))
+                if out > 0:
+                    price = 1.0 / (out / (10 ** decimals))
+                    state["api_stats"]["price_ok"] += 1
+                    _price_cache[mint] = (now, price)
+                    log.debug(f"price/quote_fallback OK [{mint[:8]}]")
+                    return price
+    except Exception as e:
+        log.debug(f"price/quote_fallback miss [{mint[:8]}]: {e}")
+
+    # ── Source 4: GeckoTerminal ───────────────────────────────────────────────
+    try:
+        async with sess.get(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
+            headers={"Accept": "application/json"},
+            timeout=_T5,
+        ) as r:
+            if r.status == 200:
+                price = float((await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0)
+                if price > 0:
+                    state["api_stats"]["price_ok"] += 1
+                    _price_cache[mint] = (now, price)
+                    log.debug(f"price/gecko fallback OK [{mint[:8]}]")
+                    return price
+    except Exception as e:
+        log.debug(f"price/gecko miss [{mint[:8]}]: {e}")
+
     state["api_stats"]["price_fail"] += 1
     _price_cache[mint] = (now, 0.0)
     log.warning(f"price: ALL sources failed for {mint[:8]}")
     return 0.0
+
 
 async def get_token_data(mint):
     try:
@@ -1286,14 +1295,10 @@ async def evaluate_new_token(pair):
     age_min       = age_sec / 60.0
     vol5m_pct     = (vol5m / liq * 100) if liq > 0 else 0
     price_1h      = float(pair.get("priceChange",{}).get("h1",0) or 0)
-    # Risky token = any risk flag present
     has_risks     = len(safety.get("risks", [])) > 0
-    # ML threshold: risky tokens need higher conviction
     min_score     = s.get("risky_min_score", 0.70) if has_risks else s.get("min_score", 0.65)
-    # Pump cap: token already pumped too much AND volume not confirming = late entry
     max_pump      = s.get("max_pump_pct_risky", 80.0) if has_risks else s.get("max_pump_pct_clean", 150.0)
     pump_too_high = price_1h > max_pump and vol5m_pct < 50.0
-    # Max age filter (0 = disabled)
     max_age_min   = s.get("max_token_age_min", 0)
     age_too_old   = max_age_min > 0 and age_min > max_age_min
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
@@ -1303,12 +1308,12 @@ async def evaluate_new_token(pair):
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
-        if ml_score < min_score:      reasons.append(f"ml={ml_score:.0%}<{min_score:.0%}({'risky' if has_risks else 'clean'})")
+        if ml_score < min_score:      reasons.append(f"ml={ml_score:.0%}<{min_score:.0%}")
         if rugged:                    reasons.append("rugged")
         if rc_too_risky:              reasons.append(f"rug={rc_score}")
         if age_sec < min_age_sec:     reasons.append(f"age={age_sec:.0f}s<{min_age_sec}s")
         if vol5m_pct < min_vol5m_pct: reasons.append(f"vol5m={vol5m_pct:.1f}%<{min_vol5m_pct}%")
-        if pump_too_high:             reasons.append(f"pump={price_1h:.0f}%>{max_pump:.0f}%,vol={vol5m_pct:.0f}%<50%")
+        if pump_too_high:             reasons.append(f"pump={price_1h:.0f}%>{max_pump:.0f}%")
         if age_too_old:               reasons.append(f"age={age_min:.0f}min>{max_age_min}min")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
@@ -1441,7 +1446,6 @@ async def monitor_positions(app):
         for is_demo, pool in [(False, state["positions"]), (True, state["demo_positions"])]:
             mints = list(pool.keys())
             if not mints: continue
-            # Batch fetch all prices in ONE API call
             price_map = await get_token_prices_batch(mints)
             missing = [m for m in mints if price_map.get(m, 0) <= 0]
             if missing:
@@ -1965,11 +1969,9 @@ async def _button_handler_inner(update, ctx, q, data):
     elif data == "set_priority_fee":
         ctx.user_data["setting"] = "priority_fee"
         cur = state["settings"].get("priority_fee", 20000)
-        sol_cost = round((cur / 1e9) * 150.0, 6)
         await q.edit_message_text(
-            f"🚀 *Priority Fee*\n\nCurrent: `{cur:,}` microlamports (~${sol_cost:.5f} per tx)\n\n"
-            f"*Presets:*\n├ Low     →  `10,000` μL\n├ Medium  →  `20,000` μL (default)\n"
-            f"├ High    →  `50,000` μL\n└ Turbo   → `200,000` μL\n\nSend a value in microlamports:",
+            f"🚀 *Priority Fee*\n\nCurrent: `{cur:,}` μL\n\n"
+            f"Low=10k / Medium=20k / High=50k / Turbo=200k\n\nSend a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRIORITY_FEE
 
     elif data == "set_risky_score":
@@ -1977,8 +1979,7 @@ async def _button_handler_inner(update, ctx, q, data):
         cur = state["settings"].get("risky_min_score", 0.70)
         await q.edit_message_text(
             f"🛡️ *Risky Token ML Threshold*\n\nCurrent: {cur:.0%}\n\n"
-            f"Tokens with ANY risk flag must score at least this to be bought.\n"
-            f"Set higher than Min Score. Recommended: 0.65–0.80\nSend a value (0–1):",
+            f"Tokens with risk flags need this ML score.\nRecommended: 0.65-0.80\nSend a value (0-1):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_RISKY_SCORE
 
     elif data == "set_max_pump_clean":
@@ -1986,9 +1987,7 @@ async def _button_handler_inner(update, ctx, q, data):
         cur = state["settings"].get("max_pump_pct_clean", 150.0)
         await q.edit_message_text(
             f"📈 *Max 1h Pump % — Clean Tokens*\n\nCurrent: {cur:.0f}%\n\n"
-            f"Reject clean tokens already pumped more than this % in 1h,\n"
-            f"UNLESS vol5m ≥ 50% of liquidity (strong momentum exemption).\n"
-            f"Recommended: 100–200%\nSend a value:",
+            f"Reject if pumped more than this (unless vol5m>=50% liq).\nRecommended: 100-200%\nSend a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_PUMP_CLEAN
 
     elif data == "set_max_pump_risky":
@@ -1996,8 +1995,7 @@ async def _button_handler_inner(update, ctx, q, data):
         cur = state["settings"].get("max_pump_pct_risky", 80.0)
         await q.edit_message_text(
             f"⚠️ *Max 1h Pump % — Risky Tokens*\n\nCurrent: {cur:.0f}%\n\n"
-            f"Stricter cap for tokens with risk flags.\n"
-            f"Recommended: 60–100%\nSend a value:",
+            f"Stricter cap for tokens with risk flags.\nRecommended: 60-100%\nSend a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_PUMP_RISKY
 
     elif data == "set_max_token_age":
@@ -2005,13 +2003,12 @@ async def _button_handler_inner(update, ctx, q, data):
         cur = state["settings"].get("max_token_age_min", 0)
         await q.edit_message_text(
             f"⏰ *Max Token Age*\n\nCurrent: {'OFF' if not cur else str(cur)+' min'}\n\n"
-            f"Reject tokens older than this. Blocks old tokens on late pumps.\n"
-            f"Set to 0 to disable. Recommended: 240–480 min\nSend a value in minutes:",
+            f"Reject tokens older than this. 0=disabled.\nRecommended: 240-480 min\nSend minutes:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_TOKEN_AGE
 
     elif data == "set_score":
         ctx.user_data["setting"] = "min_score"
-        await q.edit_message_text(f"🧠 *Min ML Score*\nCurrent: {state['settings']['min_score']:.0%}\n\nSend 0–1 (e.g. 0.65):",
+        await q.edit_message_text(f"🧠 *Min ML Score*\nCurrent: {state['settings']['min_score']:.0%}\n\nSend 0-1 (e.g. 0.65):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_SCORE
 
     elif data == "set_liq":
@@ -2225,14 +2222,12 @@ async def _button_handler_inner(update, ctx, q, data):
             f"├ Confirm: {a['confirm_ok']} ok | {a['confirm_timeout']} timeout\n"
             f"├ RPC Reconnects: {a.get('rpc_reconnects',0)}\n\n"
             f"*Price Sources:*\n"
-            f"├ Jup Batch: {ss('jup_batch')}  Jup v2: {ss('jup_v2')}\n"
-            f"├ DexScreener: {ss('dexscreener')}  Jup Quote: {ss('jup_quote')}\n"
-            f"└ GeckoTerminal: {ss('gecko')}\n\n"
+            f"├ Jup Batch:{ss('jup_batch')} Jup v2:{ss('jup_v2')} DexScreener:{ss('dexscreener')}\n"
+            f"└ Jup Quote:{ss('jup_quote')} GeckoTerminal:{ss('gecko')}\n\n"
             f"*Entry Filters:*\n"
             f"├ Min Score: {state['settings'].get('min_score',0.65):.0%}{score_warn}\n"
-            f"├ Risky ML:  {state['settings'].get('risky_min_score',0.70):.0%}\n"
-            f"├ Max Pump Clean/Risky: {state['settings'].get('max_pump_pct_clean',150):.0f}%/{state['settings'].get('max_pump_pct_risky',80):.0f}%\n"
-            f"└ Max Age: {'OFF' if not state['settings'].get('max_token_age_min') else str(state['settings'].get('max_token_age_min'))+'min'}\n\n"
+            f"├ Risky ML: {state['settings'].get('risky_min_score',0.70):.0%}  Max Age: {'OFF' if not state['settings'].get('max_token_age_min') else str(state['settings'].get('max_token_age_min'))+'min'}\n"
+            f"└ Pump Cap: {state['settings'].get('max_pump_pct_clean',150):.0f}%/{state['settings'].get('max_pump_pct_risky',80):.0f}%\n\n"
             f"*State:*\n"
             f"├ Positions: {len(state['positions'])} real / {len(state['demo_positions'])} demo\n"
             f"├ ML: {len(state['ml_features'])} samples | {'Ready' if ml_ready else 'Training'}\n"
