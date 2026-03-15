@@ -106,6 +106,10 @@ WAITING_SET_MULTI_SIGNAL_CNT = 45
 WAITING_SET_PRE_TP_TRAIL     = 46  # pre-TP fast trailing stop %
 WAITING_SET_PRE_TP_TRAIL_ACT = 47  # activation threshold (e.g. 1.1x)
 WAITING_SET_PRIORITY_FEE     = 48  # priority fee in microlamports
+WAITING_SET_RISKY_SCORE      = 49  # risky token ML threshold
+WAITING_SET_MAX_PUMP_CLEAN   = 50  # max 1h pump % for clean tokens
+WAITING_SET_MAX_PUMP_RISKY   = 51  # max 1h pump % for risky tokens
+WAITING_SET_MAX_TOKEN_AGE    = 52  # max token age in minutes
 
 def validate_config():
     missing = [k for k, v in {
@@ -882,11 +886,7 @@ def kb_settings():
         [InlineKeyboardButton(f"⚡ Entry Slip: {s.get('entry_slippage_bps',s['slippage_bps'])}bps", callback_data="set_entry_slip"),
          InlineKeyboardButton(f"⚡ Exit Slip: {s.get('exit_slippage_bps',200)}bps",  callback_data="set_exit_slip")],
         [InlineKeyboardButton(f"🚀 Priority Fee: {s.get('priority_fee',20000):,} μL", callback_data="set_priority_fee")],
-        [InlineKeyboardButton(f"🧠 Min Score: {s['min_score']:.0%}",           callback_data="set_score")],
-        [InlineKeyboardButton(f"💧 Min Liq: ${s['min_liquidity']:,.0f}",       callback_data="set_liq"),
-         InlineKeyboardButton(f"🛡️ Max Rug: {s['min_rugcheck']}",             callback_data="set_rugcheck")],
-        [InlineKeyboardButton(f"⏱ Min Age: {s.get('min_token_age_sec',120)}s", callback_data="set_min_age"),
-         InlineKeyboardButton(f"📊 Vol5m≥: {s.get('min_vol5m_pct',10)}% liq", callback_data="set_vol5m")],
+        [InlineKeyboardButton("🔍 Entry Filter Settings",        callback_data="entry_filters_menu")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
         [InlineKeyboardButton(hm,  callback_data="toggle_house_money"),
@@ -935,6 +935,40 @@ def kb_dump_detection():
         [InlineKeyboardButton(f"⏸ Stagnation %: {s.get('stagnation_pct',2.0)}%",      callback_data="set_stagnation_pct"),
          InlineKeyboardButton(f"⏱ Window: {s.get('stagnation_secs',60)}s",             callback_data="set_stagnation_secs")],
         [InlineKeyboardButton(f"⏰ Max Hold: {s.get('max_hold_minutes', 120)}min",         callback_data="set_max_hold")],
+        [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
+    ])
+
+def kb_entry_filters():
+    s = state["settings"]
+    age_off = not s.get("max_token_age_min")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🧠 Min ML Score: {s.get('min_score', 0.65):.0%}",
+            callback_data="set_score"),
+         InlineKeyboardButton(
+            f"🛡️ Risky ML: {s.get('risky_min_score', 0.70):.0%}",
+            callback_data="set_risky_score")],
+        [InlineKeyboardButton(
+            f"💧 Min Liq: ${s.get('min_liquidity', 50000):,.0f}",
+            callback_data="set_liq"),
+         InlineKeyboardButton(
+            f"🛡️ Max Rug: {s.get('min_rugcheck', 500)}",
+            callback_data="set_rugcheck")],
+        [InlineKeyboardButton(
+            f"⏱ Min Age: {s.get('min_token_age_sec', 120)}s",
+            callback_data="set_min_age"),
+         InlineKeyboardButton(
+            f"⏰ Max Age: {'OFF' if age_off else str(s.get('max_token_age_min', 0))+'min'}",
+            callback_data="set_max_token_age")],
+        [InlineKeyboardButton(
+            f"📊 Min Vol5m: {s.get('min_vol5m_pct', 10)}% liq",
+            callback_data="set_vol5m")],
+        [InlineKeyboardButton(
+            f"📈 Pump Cap (clean): {s.get('max_pump_pct_clean', 150):.0f}%",
+            callback_data="set_max_pump_clean"),
+         InlineKeyboardButton(
+            f"⚠️ Pump Cap (risky): {s.get('max_pump_pct_risky', 80):.0f}%",
+            callback_data="set_max_pump_risky")],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
     ])
 
@@ -1785,6 +1819,23 @@ async def _button_handler_inner(update, ctx, q, data):
         await q.edit_message_text("⚙️ *Settings*\n\nTap any setting to change it:",
             parse_mode="Markdown", reply_markup=kb_settings())
 
+    elif data == "entry_filters_menu":
+        s = state["settings"]
+        age_off = not s.get("max_token_age_min")
+        await q.edit_message_text(
+            f"🔍 *Entry Filter Settings*\n\n"
+            f"Controls what tokens the bot is allowed to snipe.\n\n"
+            f"├ Min ML Score:       {s.get('min_score', 0.65):.0%}\n"
+            f"├ Risky ML Threshold: {s.get('risky_min_score', 0.70):.0%}\n"
+            f"├ Min Liquidity:      ${s.get('min_liquidity', 50000):,.0f}\n"
+            f"├ Max RugCheck Score: {s.get('min_rugcheck', 500)}\n"
+            f"├ Min Token Age:      {s.get('min_token_age_sec', 120)}s\n"
+            f"├ Max Token Age:      {'OFF' if age_off else str(s.get('max_token_age_min'))+'min'}\n"
+            f"├ Min Vol5m:          {s.get('min_vol5m_pct', 10)}% of liquidity\n"
+            f"├ Pump Cap (clean):   {s.get('max_pump_pct_clean', 150):.0f}%\n"
+            f"└ Pump Cap (risky):   {s.get('max_pump_pct_risky', 80):.0f}%",
+            parse_mode="Markdown", reply_markup=kb_entry_filters())
+
     elif data == "dump_detection_menu":
         s = state["settings"]
         await q.edit_message_text(
@@ -2494,6 +2545,10 @@ def main():
             WAITING_SET_PRE_TP_TRAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRE_TP_TRAIL_ACT:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRIORITY_FEE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_RISKY_SCORE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MAX_PUMP_CLEAN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MAX_PUMP_RISKY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MAX_TOKEN_AGE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
