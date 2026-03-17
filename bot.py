@@ -58,6 +58,7 @@ AUTHORIZED_USER  = int(os.getenv("AUTHORIZED_USER_ID", 0))
 DATABASE_URL     = os.getenv("DATABASE_URL", "")
 JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"
+TURBO_EXIT_FEE_MULTIPLIER = 3   # priority fee multiplier for pre-TP trail exits
 JUPITER_PRICE_API = "https://lite-api.jup.ag/price/v2"
 DEXSCREENER_API   = "https://api.dexscreener.com/latest/dex/tokens/"
 RUGCHECK_API      = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
@@ -107,10 +108,15 @@ WAITING_SET_PRE_TP_TRAIL     = 46  # pre-TP fast trailing stop %
 WAITING_SET_PRE_TP_TRAIL_ACT = 47  # activation threshold (e.g. 1.1x)
 WAITING_SET_PRIORITY_FEE     = 48  # priority fee in microlamports
 WAITING_SET_RISKY_SCORE      = 49  # risky token ML threshold
-WAITING_SET_MAX_PUMP_CLEAN   = 50  # max 1h pump % for clean tokens
-WAITING_SET_MAX_PUMP_RISKY   = 51  # max 1h pump % for risky tokens
-WAITING_SET_MAX_TOKEN_AGE    = 52  # max token age in minutes
-WAITING_PNL_CUSTOM_HOURS     = 53  # custom P&L window input
+WAITING_SET_MAX_PUMP_CLEAN       = 50  # max 1h pump % for clean tokens
+WAITING_SET_MAX_PUMP_RISKY       = 51  # max 1h pump % for risky tokens
+WAITING_SET_MAX_TOKEN_AGE        = 52  # max token age in minutes
+WAITING_PNL_CUSTOM_HOURS         = 53  # custom P&L window input
+WAITING_SET_MG_AGE_MAX           = 54  # momentum gate: max token age (min)
+WAITING_SET_MG_PUMP_MIN          = 55  # momentum gate: min pump % to trigger gate
+WAITING_SET_MG_BUY_RATIO         = 56  # momentum gate: min buy/sell ratio
+WAITING_SET_MG_PRICE5M_MIN       = 57  # momentum gate: min 5m price change %
+WAITING_SET_TURBO_MULT           = 58  # turbo exit fee multiplier
 
 def validate_config():
     missing = [k for k, v in {
@@ -219,7 +225,8 @@ state = {
         "slippage_bps": 100,
         "entry_slippage_bps": 100,
         "exit_slippage_bps": 200,
-        "priority_fee": 20000,
+        "priority_fee":        20000,
+        "turbo_exit_fee_mult": 3,     # multiplier on priority_fee for pre-TP trail exits
         # Bot modes
         "auto_snipe": False,
         "demo_mode": False,
@@ -265,8 +272,8 @@ state = {
         # up until TP is hit. Catches fast reversals before the slower
         # multi-signal system can accumulate enough signal votes.
         # Set pre_tp_trail_pct to 0 to disable.
-        "pre_tp_trail_pct":      3.0,   # % drop from peak that triggers exit
-        "pre_tp_trail_act_mult": 1.1,   # multiplier at which this trail activates
+        "pre_tp_trail_pct":      1.5,   # % drop from peak — tightened for fast exits
+        "pre_tp_trail_act_mult": 1.05,  # activates earlier so trail arms sooner
         # ── Multi-signal exit (NEW) ───────────────────────────────────────
         # How many of the 3 dump signals must fire together to force an exit.
         # 1 = any single signal exits  (aggressive)
@@ -284,6 +291,19 @@ state = {
         "stagnation_secs": 60,    # observation window in seconds
         # Wallet concentration filter
         "max_wallet_concentration": 40.0,
+        # ── Momentum Entry Gate ───────────────────────────────────────────────
+        # For young tokens (<mg_age_max_min) that have already pumped heavily
+        # (>mg_pump_min_pct on 1h), require active momentum signals at entry.
+        # This separates mid-pump entries (still running) from post-pump entries
+        # (already topped). All three conditions must pass to allow entry:
+        #   1. buys5m / sells5m >= mg_buy_ratio       (buy pressure still dominant)
+        #   2. price_5m_change  >= mg_price5m_min_pct (still actively moving up)
+        # Set mg_enabled to False to disable entirely.
+        "mg_enabled":         True,
+        "mg_age_max_min":     15.0,   # gate only applies to tokens younger than this
+        "mg_pump_min_pct":    150.0,  # gate only activates if 1h pump exceeds this
+        "mg_buy_ratio":       1.5,    # buys5m must be >= sells5m * this ratio
+        "mg_price5m_min_pct": 5.0,    # price must still be rising >= this % on 5m
     },
     "ml_features": [], "ml_labels": [],
     "daily_pnl": 0.0,
@@ -336,8 +356,11 @@ async def db_load_settings():
     if s.get("min_score", 0) < 0.50:
         log.warning(f"min_score={s['min_score']} below floor — resetting to 0.65")
         s["min_score"] = 0.65; changed = True
-    for k, v in [("risky_min_score", 0.70), ("max_pump_pct_clean", 150.0),
-                 ("max_pump_pct_risky", 80.0), ("max_token_age_min", 0), ("priority_fee", 20000)]:
+    for k, v in [("risky_min_score", 0.70), ("max_pump_pct_clean", 100.0),
+                 ("max_pump_pct_risky", 50.0), ("max_token_age_min", 0), ("priority_fee", 20000),
+                 ("turbo_exit_fee_mult", 3),
+                 ("mg_enabled", True), ("mg_age_max_min", 15.0), ("mg_pump_min_pct", 150.0),
+                 ("mg_buy_ratio", 1.5), ("mg_price5m_min_pct", 5.0)]:
         if k not in s: s[k] = v; changed = True
     if changed: await db_save_settings()
 
@@ -888,6 +911,25 @@ async def execute_sell(mint, token_amt):
     return {"signature": sig, "confirmed": await confirm_tx(sig),
             "usdc_received": int(q.get("outAmount",0))/1e6}
 
+async def execute_sell_turbo(mint, token_amt):
+    """
+    High-priority sell for time-critical exits (pre-TP trail).
+    Uses turbo_exit_fee_mult × priority_fee to jump the validator queue
+    and land in the next block. Costs <$0.01 extra per trade.
+    """
+    if token_amt <= 0: return None
+    mult     = int(state["settings"].get("turbo_exit_fee_mult", TURBO_EXIT_FEE_MULTIPLIER))
+    turbo_fee = state["settings"].get("priority_fee", 20000) * mult
+    q = await get_quote(mint, USDC_MINT, token_amt, state["settings"].get("exit_slippage_bps", state["settings"]["slippage_bps"]))
+    if not q: return None
+    tx = await get_swap_tx(q, turbo_fee)
+    if not tx: return None
+    sig = await sign_and_send(tx)
+    if not sig: return None
+    log.info(f"Turbo exit: {mint[:8]} | fee={turbo_fee:,} μL ({mult}x)")
+    return {"signature": sig, "confirmed": await confirm_tx(sig),
+            "usdc_received": int(q.get("outAmount",0))/1e6}
+
 # ============================================================
 # KEYBOARDS
 # ============================================================
@@ -921,7 +963,8 @@ def kb_settings():
          InlineKeyboardButton(f"💵 Amount: ${s['trade_amount']}",              callback_data="set_amount")],
         [InlineKeyboardButton(f"⚡ Entry Slip: {s.get('entry_slippage_bps',s['slippage_bps'])}bps", callback_data="set_entry_slip"),
          InlineKeyboardButton(f"⚡ Exit Slip: {s.get('exit_slippage_bps',200)}bps",  callback_data="set_exit_slip")],
-        [InlineKeyboardButton(f"🚀 Priority Fee: {s.get('priority_fee',20000):,} μL", callback_data="set_priority_fee")],
+        [InlineKeyboardButton(f"🚀 Priority Fee: {s.get('priority_fee',20000):,} μL", callback_data="set_priority_fee"),
+         InlineKeyboardButton(f"⚡ Turbo Mult: {s.get('turbo_exit_fee_mult',3)}x", callback_data="set_turbo_mult")],
         [InlineKeyboardButton("🔍 Entry Filter Settings",        callback_data="entry_filters_menu")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
@@ -977,6 +1020,7 @@ def kb_dump_detection():
 def kb_entry_filters():
     s = state["settings"]
     age_off = not s.get("max_token_age_min")
+    mg_on   = s.get("mg_enabled", True)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"🧠 Min ML Score: {s.get('min_score', 0.65):.0%}",
@@ -1000,11 +1044,26 @@ def kb_entry_filters():
             f"📊 Min Vol5m: {s.get('min_vol5m_pct', 10)}% liq",
             callback_data="set_vol5m")],
         [InlineKeyboardButton(
-            f"📈 Pump Cap (clean): {s.get('max_pump_pct_clean', 150):.0f}%",
+            f"📈 Pump Cap (clean): {s.get('max_pump_pct_clean', 100):.0f}%",
             callback_data="set_max_pump_clean"),
          InlineKeyboardButton(
-            f"⚠️ Pump Cap (risky): {s.get('max_pump_pct_risky', 80):.0f}%",
+            f"⚠️ Pump Cap (risky): {s.get('max_pump_pct_risky', 50):.0f}%",
             callback_data="set_max_pump_risky")],
+        [InlineKeyboardButton(
+            f"{'🟢' if mg_on else '🔴'} Momentum Gate: {'ON' if mg_on else 'OFF'}",
+            callback_data="toggle_mg")],
+        [InlineKeyboardButton(
+            f"⏳ MG Max Age: {s.get('mg_age_max_min', 15.0):.0f}min",
+            callback_data="set_mg_age"),
+         InlineKeyboardButton(
+            f"🚀 MG Min Pump: {s.get('mg_pump_min_pct', 150.0):.0f}%",
+            callback_data="set_mg_pump")],
+        [InlineKeyboardButton(
+            f"📊 MG B/S Ratio: {s.get('mg_buy_ratio', 1.5):.1f}x",
+            callback_data="set_mg_ratio"),
+         InlineKeyboardButton(
+            f"📈 MG 5m Price: {s.get('mg_price5m_min_pct', 5.0):.1f}%",
+            callback_data="set_mg_price5m")],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
     ])
 
@@ -1222,6 +1281,9 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
     entry = pos["entry_price"]
     mult  = price / entry if entry > 0 else 1
     hm    = pos.get("capital_recovered", False)
+    # Pre-TP trail exits and fast signal exits use turbo fee for max speed
+    is_turbo = not is_demo and ("Pre-TP Trail" in reason or "⚡" in reason)
+    _sell    = execute_sell_turbo if is_turbo else execute_sell
     if hm:
         token_amt = pos.get("token_amount", 0)
         gross     = token_amt * price
@@ -1231,7 +1293,7 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
             proj     = net_pnl * (state["settings"]["trade_amount"] / state["settings"]["demo_trade_amount"])
             proj_txt = f"💡 Real projection: *${proj:+.2f}*\n"
         else:
-            sell_r   = await execute_sell(mint, token_amt)
+            sell_r   = await _sell(mint, token_amt)
             usdc_bk  = sell_r["usdc_received"] if sell_r else gross * 0.997
             sell_fee = calc_fees(usdc_bk)["dex_fee"]
             net_pnl  = usdc_bk - sell_fee
@@ -1245,7 +1307,7 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
             proj     = net_pnl * (state["settings"]["trade_amount"] / state["settings"]["demo_trade_amount"])
             proj_txt = f"💡 Real projection: *${proj:+.2f}*\n"
         else:
-            sell_r   = await execute_sell(mint, pos.get("token_amount", 0))
+            sell_r   = await _sell(mint, pos.get("token_amount", 0))
             usdc_bk  = sell_r["usdc_received"] if sell_r else pos["amount_usd"]*mult*0.997
             net_pnl  = usdc_bk - pos["amount_usd"] - pos["fees_paid"]
             sig_link = f"\n🔗 [Solscan](https://solscan.io/tx/{sell_r['signature']})" if sell_r else ""
@@ -1365,16 +1427,44 @@ async def evaluate_new_token(pair):
     age_min       = age_sec / 60.0
     vol5m_pct     = (vol5m / liq * 100) if liq > 0 else 0
     price_1h      = float(pair.get("priceChange",{}).get("h1",0) or 0)
+    price_5m      = float(pair.get("priceChange",{}).get("m5",0) or 0)
+    b5m           = float(pair.get("txns",{}).get("m5",{}).get("buys",0) or 0)
+    s5m           = float(pair.get("txns",{}).get("m5",{}).get("sells",0) or 0)
     has_risks     = len(safety.get("risks", [])) > 0
     min_score     = s.get("risky_min_score", 0.70) if has_risks else s.get("min_score", 0.65)
-    max_pump      = s.get("max_pump_pct_risky", 80.0) if has_risks else s.get("max_pump_pct_clean", 150.0)
-    pump_too_high = price_1h > max_pump and vol5m_pct < 50.0
+    max_pump      = s.get("max_pump_pct_risky", 50.0) if has_risks else s.get("max_pump_pct_clean", 100.0)
+
+    # Hard pump cap — no vol5m bypass. If the 1h pump already exceeds the cap,
+    # the token has run. Volume being high doesn't make a post-pump entry safer.
+    pump_too_high = price_1h > max_pump
+
     max_age_min   = s.get("max_token_age_min", 0)
     age_too_old   = max_age_min > 0 and age_min > max_age_min
+
+    # ── Momentum Entry Gate ──────────────────────────────────────────────────
+    # For young tokens that have heavily pumped, only allow entry if momentum
+    # signals confirm the pump is still ongoing — not already topped out.
+    # Checks: buy pressure still dominant AND price still actively rising on 5m.
+    mg_blocked = False
+    mg_reason  = ""
+    if s.get("mg_enabled", True):
+        mg_age   = s.get("mg_age_max_min", 15.0)
+        mg_pump  = s.get("mg_pump_min_pct", 150.0)
+        mg_ratio = s.get("mg_buy_ratio", 1.5)
+        mg_p5m   = s.get("mg_price5m_min_pct", 5.0)
+        if age_min < mg_age and price_1h > mg_pump:
+            buy_sell_ratio = b5m / (s5m + 1)
+            if buy_sell_ratio < mg_ratio:
+                mg_blocked = True
+                mg_reason  = f"mg_buy_ratio={buy_sell_ratio:.1f}<{mg_ratio} (sells catching up)"
+            elif price_5m < mg_p5m:
+                mg_blocked = True
+                mg_reason  = f"mg_price5m={price_5m:.1f}%<{mg_p5m}% (momentum fading)"
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
               and not rc_too_risky and age_sec >= min_age_sec
               and vol5m_pct >= min_vol5m_pct
-              and not pump_too_high and not age_too_old)
+              and not pump_too_high and not age_too_old
+              and not mg_blocked)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1385,11 +1475,13 @@ async def evaluate_new_token(pair):
         if vol5m_pct < min_vol5m_pct: reasons.append(f"vol5m={vol5m_pct:.1f}%<{min_vol5m_pct}%")
         if pump_too_high:             reasons.append(f"pump={price_1h:.0f}%>{max_pump:.0f}%")
         if age_too_old:               reasons.append(f"age={age_min:.0f}min>{max_age_min}min")
+        if mg_blocked:                reasons.append(f"momentum_gate [{mg_reason}]")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
             "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
             "market_cap": float(pair.get("marketCap",0) or 0),
             "price_change": float(pair.get("priceChange",{}).get("h1",0) or 0),
+            "price_5m": price_5m, "buy_sell_ratio": b5m / (s5m + 1),
             "ml_score": ml_score, "safety": safety, "rc_score": rc_score,
             "features": features, "passes_rules": passes}
 
@@ -1446,7 +1538,8 @@ async def auto_sniper_loop(app):
                     f"├ Vol5m:      ${info.get('vol5m',0):,.0f} ({info.get('vol5m_pct',0):.1f}% of liq)\n"
                     f"├ Age:        {age_min:.1f} min\n"
                     f"├ Market Cap: ${info['market_cap']:,.0f}\n"
-                    f"├ Price 1h:   {info['price_change']:+.1f}%\n"
+                    f"├ Price 1h:   {info['price_change']:+.1f}%  │  5m: {info.get('price_5m',0):+.1f}%\n"
+                    f"├ B/S Ratio:  {info.get('buy_sell_ratio',0):.2f}x\n"
                     f"├ ML Score:   {info['ml_score']:.0%} confidence\n"
                     f"├ RugCheck:   {info['rc_score']} (lower=safer)\n"
                     f"└ Risks:      {risks}\n"
@@ -1510,27 +1603,42 @@ async def monitor_positions(app):
     log.info("Position monitor started.")
     price_history: dict = {}  # mint -> [(timestamp, price), ...]
     vol5m_history: dict = {}  # mint -> [vol5m, ...]
+    # Shared price cache written by the price-fetch layer, read by the exit-check layer.
+    # Decouples API call rate (every 0.5s) from exit-check rate (every 0.1s) so we
+    # get fast exits without hammering Jupiter with 10 calls/second.
+    _live_prices: dict = {}   # mint -> float price
+    _last_price_fetch = 0.0
 
     while True:
-        await asyncio.sleep(0.5)
-        for is_demo, pool in [(False, state["positions"]), (True, state["demo_positions"])]:
-            mints = list(pool.keys())
-            if not mints: continue
-            price_map = await get_token_prices_batch(mints)
-            missing = [m for m in mints if price_map.get(m, 0) <= 0]
+        await asyncio.sleep(0.1)   # exit logic checks every 100ms
+
+        now_t = time.time()
+        all_mints = list(state["positions"].keys()) + list(state["demo_positions"].keys())
+
+        # ── Price fetch layer: hit the API every 0.5s maximum ───────────────
+        # This keeps API call rate identical to before while exit checks run 5x faster.
+        if all_mints and now_t - _last_price_fetch >= 0.5:
+            _last_price_fetch = now_t
+            price_map = await get_token_prices_batch(all_mints)
+            missing = [m for m in all_mints if price_map.get(m, 0) <= 0]
             if missing:
-                fallbacks = await asyncio.gather(*[get_token_price(m) for m in missing], return_exceptions=True)
+                fallbacks = await asyncio.gather(
+                    *[get_token_price(m) for m in missing], return_exceptions=True)
                 for m, p in zip(missing, fallbacks):
                     if isinstance(p, float) and p > 0: price_map[m] = p
+            # Merge into live cache — only update entries that got a real price
+            for m, p in price_map.items():
+                if p > 0: _live_prices[m] = p
+            # Evict mints no longer in any position
+            for m in list(_live_prices):
+                if m not in all_mints: del _live_prices[m]
 
+        # ── Exit check layer: runs every 100ms using cached prices ──────────
+        for is_demo, pool in [(False, state["positions"]), (True, state["demo_positions"])]:
             for mint, pos in list(pool.items()):
                 try:
-                    price = price_map.get(mint, 0.0)
-                    if price <= 0:
-                        # One immediate retry before skipping this tick
-                        await asyncio.sleep(0.3)
-                        price = await get_token_price(mint)
-                    if price <= 0: continue
+                    price = _live_prices.get(mint, 0.0)
+                    if price <= 0: continue   # wait for next price fetch cycle
                     pos["current_price"] = price
                     entry = pos["entry_price"]; mult = price / entry
                     tp = state["settings"]["take_profit"]
@@ -1858,6 +1966,8 @@ async def _button_handler_inner(update, ctx, q, data):
     elif data == "entry_filters_menu":
         s = state["settings"]
         age_off = not s.get("max_token_age_min")
+        mg_on   = s.get("mg_enabled", True)
+        mg_status = "ON ✅" if mg_on else "OFF 🔴"
         await q.edit_message_text(
             f"🔍 *Entry Filter Settings*\n\n"
             f"Controls what tokens the bot is allowed to snipe.\n\n"
@@ -1868,8 +1978,13 @@ async def _button_handler_inner(update, ctx, q, data):
             f"├ Min Token Age:      {s.get('min_token_age_sec', 120)}s\n"
             f"├ Max Token Age:      {'OFF' if age_off else str(s.get('max_token_age_min'))+'min'}\n"
             f"├ Min Vol5m:          {s.get('min_vol5m_pct', 10)}% of liquidity\n"
-            f"├ Pump Cap (clean):   {s.get('max_pump_pct_clean', 150):.0f}%\n"
-            f"└ Pump Cap (risky):   {s.get('max_pump_pct_risky', 80):.0f}%",
+            f"├ Pump Cap (clean):   {s.get('max_pump_pct_clean', 100):.0f}%\n"
+            f"├ Pump Cap (risky):   {s.get('max_pump_pct_risky', 50):.0f}%\n\n"
+            f"*🔥 Momentum Entry Gate: {mg_status}*\n"
+            f"_Blocks young tokens that have already pumped but lost momentum._\n"
+            f"├ Applies to tokens: age < {s.get('mg_age_max_min', 15.0):.0f}min AND pump > {s.get('mg_pump_min_pct', 150.0):.0f}%\n"
+            f"├ Requires B/S ratio: ≥ {s.get('mg_buy_ratio', 1.5):.1f}x (buys still dominating)\n"
+            f"└ Requires 5m price:  ≥ +{s.get('mg_price5m_min_pct', 5.0):.1f}% (momentum still active)",
             parse_mode="Markdown", reply_markup=kb_entry_filters())
 
     elif data == "dump_detection_menu":
@@ -2040,9 +2155,12 @@ async def _button_handler_inner(update, ctx, q, data):
         ctx.user_data["setting"] = "priority_fee"
         cur = state["settings"].get("priority_fee", 20000)
         sol_cost = round((cur / 1e9) * 150.0, 6)
+        turbo_fee = cur * int(state["settings"].get("turbo_exit_fee_mult", 3))
+        turbo_cost = round((turbo_fee / 1e9) * 150.0, 6)
         await q.edit_message_text(
             f"🚀 *Priority Fee*\n\n"
-            f"Current: `{cur:,}` microlamports (~${sol_cost:.5f} per tx)\n\n"
+            f"Current: `{cur:,}` microlamports (~${sol_cost:.5f} per tx)\n"
+            f"Turbo exits use: `{turbo_fee:,}` μL (~${turbo_cost:.5f})\n\n"
             f"This fee is added to every buy and sell transaction to give it "
             f"priority treatment in the Solana validator queue.\n\n"
             f"*Presets:*\n"
@@ -2053,13 +2171,21 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Send a custom value in microlamports:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRIORITY_FEE
 
-    elif data == "set_priority_fee":
-        ctx.user_data["setting"] = "priority_fee"
-        cur = state["settings"].get("priority_fee", 20000)
+    elif data == "set_turbo_mult":
+        ctx.user_data["setting"] = "turbo_exit_fee_mult"
+        cur     = int(state["settings"].get("turbo_exit_fee_mult", 3))
+        base    = state["settings"].get("priority_fee", 20000)
+        turbo   = base * cur
+        t_cost  = round((turbo / 1e9) * 150.0, 6)
         await q.edit_message_text(
-            f"🚀 *Priority Fee*\n\nCurrent: `{cur:,}` μL\n\n"
-            f"Low=10k / Medium=20k / High=50k / Turbo=200k\n\nSend a value:",
-            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRIORITY_FEE
+            f"⚡ *Turbo Exit Fee Multiplier*\n\n"
+            f"Current: *{cur}x* (base {base:,} μL → turbo {turbo:,} μL ≈ ${t_cost:.5f})\n\n"
+            f"Applied to pre-TP trail exits only — these are time-critical and need\n"
+            f"to land in the next block to capture the peak price.\n\n"
+            f"Higher = faster confirmation, slightly more cost per turbo exit.\n"
+            f"Recommended: *3x* (default) or *5x* for very volatile tokens.\n\n"
+            f"Send a multiplier (e.g. 2, 3, 5):",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_TURBO_MULT
 
     elif data == "set_risky_score":
         ctx.user_data["setting"] = "risky_min_score"
@@ -2079,10 +2205,11 @@ async def _button_handler_inner(update, ctx, q, data):
 
     elif data == "set_max_pump_risky":
         ctx.user_data["setting"] = "max_pump_pct_risky"
-        cur = state["settings"].get("max_pump_pct_risky", 80.0)
+        cur = state["settings"].get("max_pump_pct_risky", 50.0)
         await q.edit_message_text(
             f"⚠️ *Max 1h Pump % — Risky Tokens*\n\nCurrent: {cur:.0f}%\n\n"
-            f"Stricter cap for tokens with risk flags.\nRecommended: 60-100%\nSend a value:",
+            f"Hard cap for tokens with risk flags. No volume bypass.\n"
+            f"Recommended: 50-70%\nSend a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_PUMP_RISKY
 
     elif data == "set_max_token_age":
@@ -2092,6 +2219,55 @@ async def _button_handler_inner(update, ctx, q, data):
             f"⏰ *Max Token Age*\n\nCurrent: {'OFF' if not cur else str(cur)+' min'}\n\n"
             f"Reject tokens older than this. 0=disabled.\nRecommended: 240-480 min\nSend minutes:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_TOKEN_AGE
+
+    elif data == "toggle_mg":
+        state["settings"]["mg_enabled"] = not state["settings"].get("mg_enabled", True)
+        await db_save_settings()
+        status = "🟢 ON" if state["settings"]["mg_enabled"] else "🔴 OFF"
+        await q.edit_message_text(
+            f"🔥 *Momentum Gate turned {status}*\n\n"
+            f"{'Blocks young heavily-pumped tokens with fading momentum.' if state['settings']['mg_enabled'] else 'All tokens pass momentum check — pump momentum not required.'}",
+            parse_mode="Markdown", reply_markup=kb_entry_filters())
+
+    elif data == "set_mg_age":
+        ctx.user_data["setting"] = "mg_age_max_min"
+        cur = state["settings"].get("mg_age_max_min", 15.0)
+        await q.edit_message_text(
+            f"⏳ *Momentum Gate — Max Token Age*\n\nCurrent: {cur:.0f}min\n\n"
+            f"Gate only applies to tokens younger than this.\n"
+            f"If a token is older, the pump was earlier and momentum check is skipped.\n"
+            f"Recommended: 10-20min\nSend minutes:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MG_AGE_MAX
+
+    elif data == "set_mg_pump":
+        ctx.user_data["setting"] = "mg_pump_min_pct"
+        cur = state["settings"].get("mg_pump_min_pct", 150.0)
+        await q.edit_message_text(
+            f"🚀 *Momentum Gate — Min Pump to Trigger*\n\nCurrent: {cur:.0f}%\n\n"
+            f"Gate only activates if 1h pump exceeds this threshold.\n"
+            f"Tokens with smaller pumps pass without momentum check.\n"
+            f"Recommended: 120-200%\nSend a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MG_PUMP_MIN
+
+    elif data == "set_mg_ratio":
+        ctx.user_data["setting"] = "mg_buy_ratio"
+        cur = state["settings"].get("mg_buy_ratio", 1.5)
+        await q.edit_message_text(
+            f"📊 *Momentum Gate — Min Buy/Sell Ratio*\n\nCurrent: {cur:.1f}x\n\n"
+            f"Buys5m must be ≥ Sells5m × this value.\n"
+            f"If sells are catching up to buys, momentum is fading.\n"
+            f"Lower = more permissive. Recommended: 1.3-2.0x\nSend a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MG_BUY_RATIO
+
+    elif data == "set_mg_price5m":
+        ctx.user_data["setting"] = "mg_price5m_min_pct"
+        cur = state["settings"].get("mg_price5m_min_pct", 5.0)
+        await q.edit_message_text(
+            f"📈 *Momentum Gate — Min 5m Price Change*\n\nCurrent: {cur:.1f}%\n\n"
+            f"Price must still be rising at least this % over the last 5 minutes.\n"
+            f"If price is flat or dropping on 5m, the pump is over.\n"
+            f"Lower = more permissive. Recommended: 3-10%\nSend a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MG_PRICE5M_MIN
 
     elif data == "set_score":
         ctx.user_data["setting"] = "min_score"
@@ -2375,7 +2551,7 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         int_keys = ("slippage_bps","entry_slippage_bps","exit_slippage_bps",
                     "max_demo_positions","max_real_positions","min_token_age_sec",
                     "max_hold_minutes","multi_signal_exit_count","stagnation_secs",
-                    "priority_fee","max_token_age_min")
+                    "priority_fee","max_token_age_min","turbo_exit_fee_mult")
         state["settings"][key] = int(val) if key in int_keys else val
         await db_save_settings()
         await update.message.reply_text(f"✅ *{key.replace('_',' ').title()}* updated to `{txt}`",
@@ -2587,6 +2763,7 @@ async def _handle_snipe(app, mint, pair, info):
         f"├ Liquidity:  ${info['liquidity']:,.0f}\n"
         f"├ Vol5m:      ${info.get('vol5m',0):,.0f} ({info.get('vol5m_pct',0):.1f}%)\n"
         f"├ Age:        {age_min:.1f} min\n"
+        f"├ Price 5m:   {info.get('price_5m',0):+.1f}%  │  B/S: {info.get('buy_sell_ratio',0):.2f}x\n"
         f"├ ML Score:   {info['ml_score']:.0%}\n"
         f"├ RugCheck:   {info['rc_score']}\n└ Risks:      {risks}\n"
     )
@@ -2672,6 +2849,11 @@ def main():
             WAITING_SET_MAX_PUMP_RISKY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_TOKEN_AGE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_PNL_CUSTOM_HOURS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pnl_custom_hours)],
+            WAITING_SET_MG_AGE_MAX:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MG_PUMP_MIN:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MG_BUY_RATIO:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MG_PRICE5M_MIN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_TURBO_MULT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
