@@ -1506,7 +1506,8 @@ async def evaluate_new_token(pair, source: str = "dexscreener"):
 
     # Hard pump cap — no vol5m bypass. If the 1h pump already exceeds the cap,
     # the token has run. Volume being high doesn't make a post-pump entry safer.
-    pump_too_high = price_1h > max_pump
+    # Pump.fun tokens are < 90s old — 1h pump % is meaningless at birth, bypass cap.
+    pump_too_high = False if is_pumpfun else price_1h > max_pump
 
     max_age_min   = s.get("max_token_age_min", 0)
     age_too_old   = max_age_min > 0 and age_min > max_age_min
@@ -2274,7 +2275,7 @@ async def _button_handler_inner(update, ctx, q, data):
         cur = state["settings"].get("max_pump_pct_clean", 150.0)
         await q.edit_message_text(
             f"📈 *Max 1h Pump % — Clean Tokens*\n\nCurrent: {cur:.0f}%\n\n"
-            f"Reject if pumped more than this (unless vol5m>=50% liq).\nRecommended: 100-200%\nSend a value:",
+            f"Hard cap — always blocks regardless of volume. Pump.fun tokens bypass this (too young for 1h data).\nRecommended: 150-300%\nSend a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_PUMP_CLEAN
 
     elif data == "set_max_pump_risky":
