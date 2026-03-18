@@ -2992,11 +2992,10 @@ async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
                     if not pairs:
                         continue
 
-                    # Prefer the Pump.fun bonding curve pair specifically.
-                    # Prefer the Pump.fun bonding curve pair specifically.
+                    # Prefer Pump.fun/LaunchLab pairs specifically.
                     # DexScreener uses "pumpfun" (no hyphen) as dexId — guard
-                    # against all known variants.
-                    PF_DEX_IDS  = {"pump-fun", "pumpfun", "pump_fun"}
+                    # against all known variants. LaunchLab is treated equally.
+                    PF_DEX_IDS  = {"pump-fun", "pumpfun", "pump_fun", "launchlab", "launch-lab", "launch_lab"}
                     pf_pairs    = [p for p in pairs if p.get("dexId") in PF_DEX_IDS]
                     other_pairs = [p for p in pairs if p.get("dexId") not in PF_DEX_IDS]
                     if pf_pairs:
