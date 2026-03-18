@@ -117,6 +117,10 @@ WAITING_SET_MG_PUMP_MIN          = 55  # momentum gate: min pump % to trigger ga
 WAITING_SET_MG_BUY_RATIO         = 56  # momentum gate: min buy/sell ratio
 WAITING_SET_MG_PRICE5M_MIN       = 57  # momentum gate: min 5m price change %
 WAITING_SET_TURBO_MULT           = 58  # turbo exit fee multiplier
+WAITING_SET_PF_MIN_LIQ           = 59  # pumpfun min liquidity threshold
+WAITING_SET_PF_MAX_WAIT          = 60  # pumpfun max wait seconds
+WAITING_SET_PF_MIN_SOL           = 61  # pumpfun min SOL reserve
+WAITING_SET_PF_MAX_WATCHERS      = 62  # pumpfun max concurrent watchers
 
 def validate_config():
     missing = [k for k, v in {
@@ -227,6 +231,14 @@ state = {
         "exit_slippage_bps": 200,
         "priority_fee":        20000,
         "turbo_exit_fee_mult": 3,     # multiplier on priority_fee for pre-TP trail exits
+        # ── Pump.fun WebSocket Sniper ─────────────────────────────────────────
+        # Connects directly to pumpportal.fun — finds tokens at birth, seconds
+        # after creation, before DexScreener even indexes them.
+        "pumpfun_enabled":          True,
+        "pumpfun_min_liq_usd":      8000,   # wait until pool reaches this USD liquidity
+        "pumpfun_max_wait_sec":     45,     # give up if liq not reached in this many seconds
+        "pumpfun_min_sol_reserve":  30,     # min SOL in bonding curve to filter instant rugs
+        "pumpfun_max_watchers":     10,     # max concurrent liquidity watchers (API rate protection)
         # Bot modes
         "auto_snipe": False,
         "demo_mode": False,
@@ -359,6 +371,9 @@ async def db_load_settings():
     for k, v in [("risky_min_score", 0.70), ("max_pump_pct_clean", 100.0),
                  ("max_pump_pct_risky", 50.0), ("max_token_age_min", 0), ("priority_fee", 20000),
                  ("turbo_exit_fee_mult", 3),
+                 ("pumpfun_enabled", True), ("pumpfun_min_liq_usd", 8000),
+                 ("pumpfun_max_wait_sec", 45), ("pumpfun_min_sol_reserve", 30),
+                 ("pumpfun_max_watchers", 10),
                  ("mg_enabled", True), ("mg_age_max_min", 15.0), ("mg_pump_min_pct", 150.0),
                  ("mg_buy_ratio", 1.5), ("mg_price5m_min_pct", 5.0)]:
         if k not in s: s[k] = v; changed = True
@@ -975,6 +990,7 @@ def kb_settings():
         [InlineKeyboardButton(f"📐 Conviction Sizing: {'ON' if s.get('conviction_sizing') else 'OFF'}", callback_data="toggle_conviction_sizing")],
         [InlineKeyboardButton("🚨 Dump Detection Settings", callback_data="dump_detection_menu")],
         [InlineKeyboardButton("📐 Tiered Trail Settings",   callback_data="tiered_trail_menu")],
+        [InlineKeyboardButton("⚡ Pump.fun Sniper Settings", callback_data="pumpfun_menu")],
         [InlineKeyboardButton("⬅️ Back to Menu",            callback_data="main_menu")],
     ])
 
@@ -1064,6 +1080,28 @@ def kb_entry_filters():
          InlineKeyboardButton(
             f"📈 MG 5m Price: {s.get('mg_price5m_min_pct', 5.0):.1f}%",
             callback_data="set_mg_price5m")],
+        [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
+    ])
+
+def kb_pumpfun():
+    s  = state["settings"]
+    on = s.get("pumpfun_enabled", True)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{'🟢' if on else '🔴'} Pump.fun Sniper: {'ON' if on else 'OFF'}",
+            callback_data="toggle_pumpfun")],
+        [InlineKeyboardButton(
+            f"💧 Min Liq: ${s.get('pumpfun_min_liq_usd', 8000):,.0f}",
+            callback_data="set_pf_min_liq"),
+         InlineKeyboardButton(
+            f"⏱ Max Wait: {s.get('pumpfun_max_wait_sec', 45)}s",
+            callback_data="set_pf_max_wait")],
+        [InlineKeyboardButton(
+            f"◎ Min SOL Reserve: {s.get('pumpfun_min_sol_reserve', 30)}",
+            callback_data="set_pf_min_sol"),
+         InlineKeyboardButton(
+            f"🔄 Max Watchers: {s.get('pumpfun_max_watchers', 10)}",
+            callback_data="set_pf_max_watchers")],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
     ])
 
@@ -2269,6 +2307,75 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Lower = more permissive. Recommended: 3-10%\nSend a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MG_PRICE5M_MIN
 
+    elif data == "pumpfun_menu":
+        s  = state["settings"]
+        on = s.get("pumpfun_enabled", True)
+        await q.edit_message_text(
+            f"⚡ *Pump.fun Sniper Settings*\n\n"
+            f"Connects directly to pumpportal.fun WebSocket.\n"
+            f"Finds tokens at birth — seconds after creation — before DexScreener.\n\n"
+            f"Status: {'🟢 ON' if on else '🔴 OFF'}\n\n"
+            f"├ Min Liquidity:   ${s.get('pumpfun_min_liq_usd', 8000):,.0f}\n"
+            f"│  _wait until pool reaches this before buying_\n"
+            f"├ Max Wait:        {s.get('pumpfun_max_wait_sec', 45)}s\n"
+            f"│  _give up if liq threshold not reached in time_\n"
+            f"├ Min SOL Reserve: {s.get('pumpfun_min_sol_reserve', 30)} SOL\n"
+            f"│  _filters near-empty bonding curves = instant rugs_\n"
+            f"└ Max Watchers:    {s.get('pumpfun_max_watchers', 10)}\n"
+            f"   _concurrent token watchers cap — protects API rate_",
+            parse_mode="Markdown", reply_markup=kb_pumpfun())
+
+    elif data == "toggle_pumpfun":
+        state["settings"]["pumpfun_enabled"] = not state["settings"].get("pumpfun_enabled", True)
+        await db_save_settings()
+        status = "🟢 ON" if state["settings"]["pumpfun_enabled"] else "🔴 OFF"
+        await q.edit_message_text(
+            f"⚡ *Pump.fun Sniper turned {status}*",
+            parse_mode="Markdown", reply_markup=kb_pumpfun())
+
+    elif data == "set_pf_min_liq":
+        ctx.user_data["setting"] = "pumpfun_min_liq_usd"
+        cur = state["settings"].get("pumpfun_min_liq_usd", 8000)
+        await q.edit_message_text(
+            f"💧 *Pump.fun — Min Liquidity Threshold*\n\nCurrent: ${cur:,.0f}\n\n"
+            f"The watcher polls DexScreener until the token's pool reaches this\n"
+            f"USD liquidity before buying. Higher = safer but slower entry.\n"
+            f"Recommended: $5,000–$15,000\nSend a USD value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PF_MIN_LIQ
+
+    elif data == "set_pf_max_wait":
+        ctx.user_data["setting"] = "pumpfun_max_wait_sec"
+        cur = state["settings"].get("pumpfun_max_wait_sec", 45)
+        await q.edit_message_text(
+            f"⏱ *Pump.fun — Max Wait Time*\n\nCurrent: {cur}s\n\n"
+            f"If the liquidity threshold isn't reached within this many seconds\n"
+            f"the token is abandoned. Prevents buying dead tokens.\n"
+            f"Recommended: 30–60s\nSend seconds:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PF_MAX_WAIT
+
+    elif data == "set_pf_min_sol":
+        ctx.user_data["setting"] = "pumpfun_min_sol_reserve"
+        cur = state["settings"].get("pumpfun_min_sol_reserve", 30)
+        await q.edit_message_text(
+            f"◎ *Pump.fun — Min SOL Reserve*\n\nCurrent: {cur} SOL\n\n"
+            f"Filters tokens with near-empty bonding curves which are likely\n"
+            f"instant rugs or pre-drained pools.\n"
+            f"Recommended: 20–50 SOL\nSend a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PF_MIN_SOL
+
+    elif data == "set_pf_max_watchers":
+        ctx.user_data["setting"] = "pumpfun_max_watchers"
+        cur = state["settings"].get("pumpfun_max_watchers", 10)
+        await q.edit_message_text(
+            f"🔄 *Pump.fun — Max Concurrent Watchers*\n\nCurrent: {cur}\n\n"
+            f"Limits how many tokens are being watched simultaneously.\n"
+            f"Each watcher makes ~1 DexScreener call every 3s.\n"
+            f"At 10 watchers = max ~3 calls/sec to DexScreener.\n\n"
+            f"Higher = catch more tokens but more API calls.\n"
+            f"Lower = fewer API calls but may miss tokens during busy periods.\n"
+            f"Recommended: 8–15\nSend a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PF_MAX_WATCHERS
+
     elif data == "set_score":
         ctx.user_data["setting"] = "min_score"
         await q.edit_message_text(f"🧠 *Min ML Score*\nCurrent: {state['settings']['min_score']:.0%}\n\nSend 0-1 (e.g. 0.65):",
@@ -2551,7 +2658,9 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         int_keys = ("slippage_bps","entry_slippage_bps","exit_slippage_bps",
                     "max_demo_positions","max_real_positions","min_token_age_sec",
                     "max_hold_minutes","multi_signal_exit_count","stagnation_secs",
-                    "priority_fee","max_token_age_min","turbo_exit_fee_mult")
+                    "priority_fee","max_token_age_min","turbo_exit_fee_mult",
+                    "pumpfun_min_liq_usd","pumpfun_max_wait_sec","pumpfun_min_sol_reserve",
+                    "pumpfun_max_watchers")
         state["settings"][key] = int(val) if key in int_keys else val
         await db_save_settings()
         await update.message.reply_text(f"✅ *{key.replace('_',' ').title()}* updated to `{txt}`",
@@ -2713,10 +2822,242 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # MAIN
 # ============================================================
+async def pumpfun_sniper(app):
+    """
+    Connects to pumpportal.fun WebSocket and subscribes to new token creation events.
+    Finds tokens at birth — seconds after launch — before DexScreener indexes them.
+    For each new token, spawns a background liquidity watcher that polls DexScreener
+    until the pool hits the min liquidity threshold, then evaluates and buys.
+    """
+    try:
+        import websockets
+    except ImportError:
+        log.warning("pumpfun_sniper: pip install websockets"); return
+
+    PUMPFUN_WSS = "wss://pumpportal.fun/api/data"
+    backoff = 2
+    log.info("Pump.fun sniper started.")
+    # Semaphore rebuilt on each reconnect so count resets cleanly
+    watcher_sem = asyncio.Semaphore(
+        int(state["settings"].get("pumpfun_max_watchers", 10)))
+
+    while True:
+        try:
+            max_w = int(state["settings"].get("pumpfun_max_watchers", 10))
+            watcher_sem = asyncio.Semaphore(max_w)
+            async with websockets.connect(
+                PUMPFUN_WSS,
+                ping_interval=20,
+                ping_timeout=30,
+                open_timeout=15,
+            ) as ws:
+                backoff = 2
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                log.info(f"Pump.fun WS connected — subscribed to newToken events (max {max_w} watchers)")
+                await _safe_notify(app,
+                    f"⚡ *Pump.fun sniper connected* — watching for new tokens at birth\n"
+                    f"_Max concurrent watchers: {max_w}_")
+
+                async for raw in ws:
+                    try:
+                        if not state["settings"].get("pumpfun_enabled", True):
+                            continue
+                        if not state["settings"]["auto_snipe"] and not state["settings"]["demo_mode"]:
+                            continue
+
+                        msg = json.loads(raw)
+
+                        # pumpportal schema: {mint, name, symbol, solAmount, marketCapSol, ...}
+                        if "mint" not in msg:
+                            continue
+
+                        mint   = msg.get("mint", "")
+                        symbol = msg.get("symbol") or msg.get("name") or mint[:8]
+
+                        if not mint or mint in state["seen_pairs"]:
+                            continue
+                        state["seen_pairs"][mint] = time.time()
+
+                        # Drop if all watcher slots are taken — don't queue
+                        if watcher_sem.locked():
+                            log.debug(f"Pump.fun: watcher slots full ({max_w}), dropping {symbol}")
+                            continue
+
+                        log.info(f"Pump.fun: new token {symbol} [{mint[:8]}]")
+
+                        # Spawn background watcher — don't block the WS reader
+                        asyncio.create_task(
+                            _pumpfun_liquidity_watcher(app, mint, symbol, watcher_sem)
+                        )
+
+                    except json.JSONDecodeError:
+                        pass
+                    except Exception as e:
+                        log_error("pumpfun_sniper/msg", e)
+
+        except Exception as e:
+            log_error("pumpfun_sniper/connect", e)
+            await _safe_notify(app,
+                f"⚠️ *Pump.fun WS disconnected* — reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
+    """
+    After a Pump.fun token is detected, polls DexScreener every 3s until the
+    pool reaches pumpfun_min_liq_usd OR pumpfun_max_wait_sec elapses.
+    Then runs the token through evaluate_new_token() and buys if it passes.
+    Uses a semaphore to cap concurrent watchers and protect API rate limits.
+    """
+    async with sem:   # holds one slot for the full lifetime of this watcher
+        s          = state["settings"]
+        min_liq    = s.get("pumpfun_min_liq_usd", 8000)
+        max_wait   = s.get("pumpfun_max_wait_sec", 45)
+        start_time = time.time()
+
+        log.info(f"Pump.fun watcher: {symbol} [{mint[:8]}] — waiting for ${min_liq:,.0f} liq")
+
+        pair = None
+        while time.time() - start_time < max_wait:
+            await asyncio.sleep(3)
+            try:
+                sess = await _get_session()
+                async with sess.get(
+                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                    timeout=aiohttp.ClientTimeout(total=6)
+                ) as r:
+                    if r.status != 200:
+                        continue
+                    data  = await r.json()
+                    pairs = [p for p in (data.get("pairs") or [])
+                             if p.get("chainId") == "solana"]
+                    if not pairs:
+                        continue
+                    pair = max(pairs,
+                               key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                    liq  = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+                    if liq >= min_liq:
+                        log.info(f"Pump.fun watcher: {symbol} reached ${liq:,.0f} — evaluating")
+                        break
+                    log.debug(f"Pump.fun watcher: {symbol} liq=${liq:,.0f} < ${min_liq:,.0f}")
+            except Exception as e:
+                log.debug(f"Pump.fun watcher poll [{symbol}]: {e}")
+
+        if pair is None:
+            log.info(f"Pump.fun watcher: {symbol} never indexed by DexScreener in {max_wait}s — skip")
+            return
+
+        liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+        if liq < min_liq:
+            log.info(f"Pump.fun watcher: {symbol} liq=${liq:,.0f} < ${min_liq:,.0f} threshold — skip")
+            return
+
+        # Re-read settings (may have changed while we were waiting)
+        s = state["settings"]
+
+        # Position limit checks before the heavier evaluate call
+        if mint in state["positions"] or mint in state["demo_positions"]:
+            return
+        if s["demo_mode"] and len(state["demo_positions"]) >= s.get("max_demo_positions", 5):
+            log.info(f"Pump.fun: demo limit reached, skipping {symbol}"); return
+        if s["auto_snipe"] and not s["demo_mode"] and \
+                len(state["positions"]) >= s.get("max_real_positions", 3):
+            log.info(f"Pump.fun: real limit reached, skipping {symbol}"); return
+
+        # Full evaluation — same filters as DexScreener sniper
+        try:
+            info = await evaluate_new_token(pair)
+        except Exception as e:
+            log_error(f"pumpfun_watcher/evaluate [{symbol}]", e); return
+
+        age_min = info.get("age_sec", 0) / 60
+        elapsed = time.time() - start_time
+        risks   = ", ".join([r.get("name", "") for r in info["safety"].get("risks", [])]) or "None"
+
+        notif = (
+            f"⚡ *Pump.fun — Liq Threshold Reached*\n{'─'*28}\n🆕 *{info['symbol']}*\n"
+            f"├ Liquidity:  ${info['liquidity']:,.0f}\n"
+            f"├ Vol5m:      ${info.get('vol5m', 0):,.0f} ({info.get('vol5m_pct', 0):.1f}% of liq)\n"
+            f"├ Age:        {age_min:.1f} min  │  Found in {elapsed:.0f}s\n"
+            f"├ Market Cap: ${info['market_cap']:,.0f}\n"
+            f"├ Price 1h:   {info['price_change']:+.1f}%  │  5m: {info.get('price_5m', 0):+.1f}%\n"
+            f"├ B/S Ratio:  {info.get('buy_sell_ratio', 0):.2f}x\n"
+            f"├ ML Score:   {info['ml_score']:.0%} confidence\n"
+            f"├ RugCheck:   {info['rc_score']} (lower=safer)\n"
+            f"└ Risks:      {risks}\n"
+        )
+
+        if not info["passes_rules"]:
+            log.info(f"Pump.fun: {symbol} failed filters — skip")
+            return
+
+        # Daily loss limit for real trades
+        if s["auto_snipe"] and not s["demo_mode"]:
+            _reset_daily_pnl_if_needed()
+            if _check_daily_loss_limit():
+                log.info(f"Pump.fun: sniper paused (daily loss limit), skipping {symbol}")
+                return
+
+        # Conviction sizing
+        if s.get("conviction_sizing") and ml_ready:
+            score = info["ml_score"]; base_amt = s["trade_amount"]
+            if score >= 0.80:   trade_amt = base_amt
+            elif score >= 0.65: trade_amt = round(base_amt * 0.75, 2)
+            else:               trade_amt = round(base_amt * 0.50, 2)
+        else:
+            trade_amt = s["trade_amount"]
+
+        if s["demo_mode"]:
+            price = await get_token_price(mint, pair_data=pair)
+            if price <= 0: return
+            amt  = s["demo_trade_amount"]; fees = calc_fees(amt)
+            pos  = {
+                "symbol": info["symbol"], "entry_price": price, "current_price": price,
+                "peak_price": price, "amount_usd": amt - fees["total"],
+                "fees_paid": fees["total"], "token_amount": (amt - fees["total"]) / price,
+                "tp_hit": False, "features": info["features"], "ml_score": info["ml_score"],
+                "auto": True, "entry_time": time.time(), "peak_vol5m": 0.0,
+                "pt_early_done": False, "source": "pumpfun",
+            }
+            state["demo_positions"][mint] = pos
+            await db_save_position(mint, pos, True)
+            await _safe_notify(app, notif + f"\n📝 *DEMO Auto-bought @ ${price:.6f}* _(Pump.fun)_")
+
+        elif s["auto_snipe"]:
+            price = await get_token_price(mint, pair_data=pair)
+            if price <= 0: return
+            sizing_note = ""
+            if s.get("conviction_sizing") and trade_amt < s["trade_amount"]:
+                sizing_note = f" _(conviction: ${trade_amt:.2f} @ {info['ml_score']:.0%})_"
+            await _safe_notify(app, notif + f"\n🤖 *Auto-sniping...{sizing_note}* _(Pump.fun)_")
+            result = await execute_buy(mint, trade_amt)
+            if result:
+                fees = calc_fees(trade_amt)
+                pos  = {
+                    "symbol": info["symbol"], "entry_price": price, "current_price": price,
+                    "peak_price": price, "amount_usd": trade_amt - fees["total"],
+                    "token_amount": result["out_amount"], "fees_paid": fees["total"],
+                    "tp_hit": False, "features": info["features"], "auto": True,
+                    "entry_time": time.time(), "peak_vol5m": 0.0,
+                    "pt_early_done": False, "source": "pumpfun",
+                }
+                state["positions"][mint] = pos
+                await db_save_position(mint, pos, False)
+                await _safe_notify(app,
+                    f"✅ *Sniped {info['symbol']}!* _(Pump.fun)_\n"
+                    f"Entry: ${price:.6f}\n"
+                    f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})")
+            else:
+                await _safe_notify(app, f"❌ Pump.fun snipe failed for {info['symbol']}")
+
+
 async def post_init(app):
     await init_db(); await load_all_from_db()
     asyncio.create_task(monitor_positions(app))
     asyncio.create_task(auto_sniper_loop(app))
+    asyncio.create_task(pumpfun_sniper(app))
+    log.info("Pump.fun sniper task started")
     if HELIUS_RPC:
         asyncio.create_task(raydium_ws_sniper(app))
         log.info("Raydium WS sniper started")
@@ -2854,6 +3195,10 @@ def main():
             WAITING_SET_MG_BUY_RATIO:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MG_PRICE5M_MIN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_TURBO_MULT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PF_MIN_LIQ:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PF_MAX_WAIT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PF_MIN_SOL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PF_MAX_WATCHERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
