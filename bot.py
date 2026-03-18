@@ -241,6 +241,11 @@ state = {
         "pumpfun_min_sol_reserve":  30,     # min SOL in bonding curve to filter instant rugs
         "pumpfun_max_watchers":     10,     # max concurrent liquidity watchers (API rate protection)
         "pumpfun_eval_min_liq":     8000,   # min liq for evaluate_new_token when source=pumpfun
+        "pf_direct_enabled":      True,     # evaluate pumpfun tokens directly from WS data
+        "pf_min_sol_in_bc":       10.0,     # min SOL in bonding curve at token creation
+        "pf_max_sol_in_bc":       500.0,    # max SOL in bonding curve (near graduation = already pumped)
+        "pf_min_initial_buy_sol": 0.1,      # min SOL spent by creator (skin in the game)
+        "pf_max_initial_buy_pct": 10.0,     # max % of supply bought by creator (insider risk)
         # Bot modes
         "auto_snipe": False,
         "demo_mode": False,
@@ -253,6 +258,7 @@ state = {
         "min_token_age_sec": 120,
         "min_vol5m_pct": 10.0,
         "min_price_5m_pct": -3.0,   # reject tokens whose 5m price is below this % (e.g. actively dumping)
+        "min_price_1h_pct": -20.0,  # reject tokens down more than this % in the last hour
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
@@ -377,9 +383,12 @@ async def db_load_settings():
                  ("pumpfun_enabled", True), ("pumpfun_min_liq_usd", 8000),
                  ("pumpfun_max_wait_sec", 180), ("pumpfun_min_sol_reserve", 30),
                  ("pumpfun_max_watchers", 10), ("pumpfun_eval_min_liq", 8000),
+                 ("pf_direct_enabled", True), ("pf_min_sol_in_bc", 10.0),
+                 ("pf_max_sol_in_bc", 500.0), ("pf_min_initial_buy_sol", 0.1),
+                 ("pf_max_initial_buy_pct", 10.0),
                  ("mg_enabled", True), ("mg_age_max_min", 15.0), ("mg_pump_min_pct", 150.0),
                  ("mg_buy_ratio", 1.5), ("mg_price5m_min_pct", 5.0),
-                 ("min_price_5m_pct", -3.0)]:
+                 ("min_price_5m_pct", -3.0), ("min_price_1h_pct", -20.0)]:
         if k not in s: s[k] = v; changed = True
     if changed: await db_save_settings()
 
@@ -1550,12 +1559,14 @@ async def evaluate_new_token(pair, source: str = "dexscreener"):
                 mg_reason  = f"mg_price5m={price_5m:.1f}%<{mg_p5m}% (momentum fading)"
     min_p5m     = s.get("min_price_5m_pct", -3.0)
     price_5m_ok = True if is_pumpfun else price_5m >= min_p5m
+    min_p1h     = s.get("min_price_1h_pct", -20.0)
+    price_1h_ok = True if is_pumpfun else price_1h >= min_p1h
 
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
               and not rc_too_risky and age_sec >= min_age_sec
               and vol5m_pct >= min_vol5m_pct
               and not pump_too_high and not age_too_old
-              and not mg_blocked and price_5m_ok)
+              and not mg_blocked and price_5m_ok and price_1h_ok)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1568,6 +1579,7 @@ async def evaluate_new_token(pair, source: str = "dexscreener"):
         if age_too_old:               reasons.append(f"age={age_min:.0f}min>{max_age_min}min")
         if mg_blocked:                reasons.append(f"momentum_gate [{mg_reason}]")
         if not price_5m_ok:           reasons.append(f"price_5m={price_5m:.1f}%<{min_p5m:.1f}%")
+        if not price_1h_ok:           reasons.append(f"price_1h={price_1h:.1f}%<{min_p1h:.1f}%")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
             "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
@@ -2947,17 +2959,20 @@ async def pumpfun_sniper(app):
                             continue
                         state["seen_pairs"][mint] = time.time()
 
-                        # Drop if all watcher slots are taken — don't queue
-                        if watcher_sem.locked():
-                            log.debug(f"Pump.fun: watcher slots full ({max_w}), dropping {symbol}")
-                            continue
-
                         log.info(f"Pump.fun: new token {symbol} [{mint[:8]}]")
 
-                        # Spawn background watcher — don't block the WS reader
-                        asyncio.create_task(
-                            _pumpfun_liquidity_watcher(app, mint, symbol, watcher_sem)
-                        )
+                        # Direct BC eval or DexScreener watcher — don't block WS reader
+                        if state["settings"].get("pf_direct_enabled", True):
+                            asyncio.create_task(
+                                _pumpfun_direct_eval(app, mint, symbol, msg, watcher_sem)
+                            )
+                        else:
+                            if watcher_sem.locked():
+                                log.debug(f"Pump.fun: watcher slots full ({max_w}), dropping {symbol}")
+                                continue
+                            asyncio.create_task(
+                                _pumpfun_liquidity_watcher(app, mint, symbol, watcher_sem)
+                            )
 
                     except json.JSONDecodeError:
                         pass
@@ -2971,6 +2986,141 @@ async def pumpfun_sniper(app):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
+
+
+async def _pumpfun_direct_eval(app, mint: str, symbol: str, msg: dict, sem: asyncio.Semaphore):
+    """
+    Evaluate a brand-new Pump.fun token directly from the WS creation message.
+    No DexScreener polling — decision made immediately from bonding curve data.
+    Falls back to _pumpfun_liquidity_watcher if Jupiter can't price it yet.
+    """
+    s = state["settings"]
+
+    # ── Extract bonding curve data ───────────────────────────────────────────
+    v_sol          = float(msg.get("vSolInBondingCurve", 0) or 0)
+    market_cap_sol = float(msg.get("marketCapSol", 0) or 0)
+    initial_buy    = float(msg.get("initialBuy", 0) or 0)
+    total_supply   = 1_000_000_000.0  # pump.fun fixed supply
+
+    min_sol      = s.get("pf_min_sol_in_bc", 10.0)
+    max_sol      = s.get("pf_max_sol_in_bc", 500.0)
+    min_init_sol = s.get("pf_min_initial_buy_sol", 0.1)
+    max_init_pct = s.get("pf_max_initial_buy_pct", 10.0)
+
+    price_per_tok = market_cap_sol / total_supply if total_supply > 0 else 0
+    init_buy_pct  = (initial_buy / total_supply * 100) if total_supply > 0 else 0
+    init_buy_sol  = initial_buy * price_per_tok
+
+    # ── Filters ──────────────────────────────────────────────────────────────
+    reasons = []
+    passes  = True
+    if v_sol < min_sol:
+        reasons.append(f"vSol={v_sol:.1f}<{min_sol} (too little liquidity)")
+        passes = False
+    if v_sol > max_sol:
+        reasons.append(f"vSol={v_sol:.1f}>{max_sol} (near graduation, likely pumped)")
+        passes = False
+    if init_buy_sol < min_init_sol:
+        reasons.append(f"init_sol={init_buy_sol:.3f}<{min_init_sol} (no skin in game)")
+        passes = False
+    if init_buy_pct > max_init_pct:
+        reasons.append(f"init_pct={init_buy_pct:.1f}%>{max_init_pct}% (insider risk)")
+        passes = False
+
+    # Position limits
+    if mint in state["positions"] or mint in state["demo_positions"]:
+        return
+    if s["demo_mode"] and len(state["demo_positions"]) >= s.get("max_demo_positions", 5):
+        log.info(f"Pump.fun direct: demo limit reached, skipping {symbol}"); return
+    if s["auto_snipe"] and not s["demo_mode"] and             len(state["positions"]) >= s.get("max_real_positions", 3):
+        log.info(f"Pump.fun direct: real limit reached, skipping {symbol}"); return
+
+    if not passes:
+        log.info(f"Pump.fun direct: {symbol} REJECTED — {', '.join(reasons)}")
+        return
+
+    log.info(f"Pump.fun direct: {symbol} PASSED — vSol={v_sol:.1f}, "
+             f"initBuy={init_buy_pct:.1f}%, mcap={market_cap_sol:.1f} SOL")
+
+    # ── Get SOL/USD price ────────────────────────────────────────────────────
+    sol_price_usd = 130.0
+    try:
+        SOL_MINT = "So11111111111111111111111111111111111111112"
+        sess = await _get_session()
+        async with sess.get(f"{JUPITER_PRICE_API}?ids={SOL_MINT}",
+                            timeout=aiohttp.ClientTimeout(total=4)) as r:
+            if r.status == 200:
+                p = float((await r.json()).get("data", {})
+                          .get(SOL_MINT, {}).get("price") or 0)
+                if p > 0:
+                    sol_price_usd = p
+    except Exception:
+        pass
+
+    liq_usd   = v_sol * sol_price_usd
+    mcap_usd  = market_cap_sol * sol_price_usd
+    price_usd = price_per_tok * sol_price_usd
+
+    _sep = "─" * 28
+    notif = (
+        f"⚡ *Pump.fun Direct — Bonding Curve*\n{_sep}\n🆕 *{symbol}*\n"
+        f"├ SOL in curve: {v_sol:.1f} SOL (≈${liq_usd:,.0f})\n"
+        f"├ Market Cap:   ${mcap_usd:,.0f}\n"
+        f"├ Creator Buy:  {init_buy_pct:.1f}% of supply\n"
+        f"└ Est. Price:   ${price_usd:.8f}\n"
+    )
+
+    if s["demo_mode"]:
+        if price_usd <= 0: return
+        amt  = s["demo_trade_amount"]; fees = calc_fees(amt)
+        pos  = {
+            "symbol": symbol, "entry_price": price_usd, "current_price": price_usd,
+            "peak_price": price_usd, "amount_usd": amt - fees["total"],
+            "fees_paid": fees["total"],
+            "token_amount": (amt - fees["total"]) / price_usd,
+            "tp_hit": False, "features": [], "ml_score": 0.0,
+            "auto": True, "entry_time": time.time(),
+            "peak_vol5m": 0.0, "pt_early_done": False, "source": "pumpfun_direct",
+        }
+        state["demo_positions"][mint] = pos
+        await db_save_position(mint, pos, True)
+        await _safe_notify(app,
+            notif + f"\n📝 *DEMO Auto-bought @ ${price_usd:.8f}* _(direct bc)_")
+        log.info(f"Pump.fun direct: DEMO bought {symbol} @ ${price_usd:.8f}")
+
+    elif s["auto_snipe"]:
+        _reset_daily_pnl_if_needed()
+        if _check_daily_loss_limit():
+            log.info(f"Pump.fun direct: paused (daily loss limit), skipping {symbol}")
+            return
+        price = await get_token_price(mint)
+        if price <= 0:
+            log.info(f"Pump.fun direct: {symbol} not priceable on Jupiter — falling back to watcher")
+            if not sem.locked():
+                asyncio.create_task(_pumpfun_liquidity_watcher(app, mint, symbol, sem))
+            return
+        await _safe_notify(app, notif + f"\n🤖 *Auto-sniping... (direct bc)*")
+        result = await execute_buy(mint, s["trade_amount"])
+        if result:
+            fees = calc_fees(s["trade_amount"])
+            pos  = {
+                "symbol": symbol, "entry_price": price, "current_price": price,
+                "peak_price": price, "amount_usd": s["trade_amount"] - fees["total"],
+                "token_amount": result["out_amount"], "fees_paid": fees["total"],
+                "tp_hit": False, "features": [], "auto": True,
+                "entry_time": time.time(), "peak_vol5m": 0.0,
+                "pt_early_done": False, "source": "pumpfun_direct",
+            }
+            state["positions"][mint] = pos
+            await db_save_position(mint, pos, False)
+            await _safe_notify(app,
+                f"✅ *Sniped {symbol}!* _(direct bc)_\n"
+                f"Entry: ${price:.8f}\n"
+                f"🔗 [Solscan](https://solscan.io/tx/{result.get('signature', '')})")
+        else:
+            await _safe_notify(app, f"❌ Direct snipe failed for {symbol} — falling back to watcher")
+            if not sem.locked():
+                asyncio.create_task(_pumpfun_liquidity_watcher(app, mint, symbol, sem))
 
 async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
     """
