@@ -2341,17 +2341,13 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Status: {'🟢 ON' if on else '🔴 OFF'}\n\n"
             f"*Watcher settings:*\n"
             f"├ Min Liq (wait):  ${s.get('pumpfun_min_liq_usd', 8000):,.0f}\n"
-            f"│  _poll until pool reaches this before evaluating_\n"
             f"├ Max Wait:        {s.get('pumpfun_max_wait_sec', 45)}s\n"
-            f"│  _give up if liq not reached in time_\n"
             f"├ Min SOL Reserve: {s.get('pumpfun_min_sol_reserve', 30)} SOL\n"
-            f"│  _filters near-empty bonding curves_\n"
-            f"└ Max Watchers:    {s.get('pumpfun_max_watchers', 10)}\n"
-            f"   _concurrent watchers cap — protects API rate_\n\n"
+            f"└ Max Watchers:    {s.get('pumpfun_max_watchers', 10)}\n\n"
             f"*Evaluation settings:*\n"
             f"└ Min Liq (eval):  ${s.get('pumpfun_eval_min_liq', 8000):,.0f}\n"
-            f"   _replaces global min\\_liquidity (${s.get('min_liquidity', 50000):,.0f}) for Pump.fun tokens_\n"
-            f"   _all other filters still apply normally_",
+            f"  Bypasses global min liq (${s.get('min_liquidity', 50000):,.0f}) for Pump.fun tokens.\n"
+            f"  All other filters (ML, rug, pump cap) still apply normally.",
             parse_mode="Markdown", reply_markup=kb_pumpfun())
 
     elif data == "toggle_pumpfun":
