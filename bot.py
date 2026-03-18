@@ -236,13 +236,13 @@ state = {
         # Connects directly to pumpportal.fun — finds tokens at birth, seconds
         # after creation, before DexScreener even indexes them.
         "pumpfun_enabled":          True,
-        "pumpfun_min_liq_usd":      8000,   # wait until pool reaches this USD liquidity
+        "pumpfun_min_liq_usd":      2000,   # wait until pool reaches this USD liquidity
         "pumpfun_max_wait_sec":     180,    # give up if liq not reached in this many seconds
         "pumpfun_min_sol_reserve":  30,     # min SOL in bonding curve to filter instant rugs
         "pumpfun_max_watchers":     10,     # max concurrent liquidity watchers (API rate protection)
-        "pumpfun_eval_min_liq":     8000,   # min liq for evaluate_new_token when source=pumpfun
+        "pumpfun_eval_min_liq":     2000,   # min liq for evaluate_new_token when source=pumpfun
         "pf_direct_enabled":      True,     # evaluate pumpfun tokens directly from WS data
-        "pf_min_sol_in_bc":       10.0,     # min SOL in bonding curve at token creation
+        "pf_min_sol_in_bc":       55.0,     # min SOL in bonding curve at token creation
         "pf_max_sol_in_bc":       500.0,    # max SOL in bonding curve (near graduation = already pumped)
         "pf_min_initial_buy_sol": 0.1,      # min SOL spent by creator (skin in the game)
         "pf_max_initial_buy_pct": 10.0,     # max % of supply bought by creator (insider risk)
@@ -380,10 +380,10 @@ async def db_load_settings():
     for k, v in [("risky_min_score", 0.70), ("max_pump_pct_clean", 100.0),
                  ("max_pump_pct_risky", 50.0), ("max_token_age_min", 0), ("priority_fee", 20000),
                  ("turbo_exit_fee_mult", 3),
-                 ("pumpfun_enabled", True), ("pumpfun_min_liq_usd", 8000),
+                 ("pumpfun_enabled", True), ("pumpfun_min_liq_usd", 2000),
                  ("pumpfun_max_wait_sec", 180), ("pumpfun_min_sol_reserve", 30),
-                 ("pumpfun_max_watchers", 10), ("pumpfun_eval_min_liq", 8000),
-                 ("pf_direct_enabled", True), ("pf_min_sol_in_bc", 10.0),
+                 ("pumpfun_max_watchers", 10), ("pumpfun_eval_min_liq", 2000),
+                 ("pf_direct_enabled", True), ("pf_min_sol_in_bc", 55.0),
                  ("pf_max_sol_in_bc", 500.0), ("pf_min_initial_buy_sol", 0.1),
                  ("pf_max_initial_buy_pct", 10.0),
                  ("mg_enabled", True), ("mg_age_max_min", 15.0), ("mg_pump_min_pct", 150.0),
@@ -1744,6 +1744,14 @@ async def monitor_positions(app):
                     price = _live_prices.get(mint, 0.0)
                     if price <= 0: continue   # wait for next price fetch cycle
                     pos["current_price"] = price
+                    # For direct BC positions, entry price was estimated from bonding curve.
+                    # Update to the first real Jupiter price so multipliers are accurate.
+                    if pos.get("source") == "pumpfun_direct" and not pos.get("entry_confirmed"):
+                        pos["entry_price"]    = price
+                        pos["peak_price"]     = price
+                        pos["entry_confirmed"] = True
+                        await db_save_position(mint, pos, is_demo)
+                        log.info(f"Direct BC entry confirmed for {pos['symbol']} @ ${price:.8f}")
                     entry = pos["entry_price"]; mult = price / entry
                     tp = state["settings"]["take_profit"]
                     sl = state["settings"]["stop_loss"]
