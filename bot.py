@@ -2975,18 +2975,20 @@ async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
                         continue
 
                     # Prefer the Pump.fun bonding curve pair specifically.
-                    # If the token has migrated to Raydium, fall back to the
-                    # highest-liq pair but log it so you can see it happened.
-                    pf_pairs    = [p for p in pairs if p.get("dexId") == "pump-fun"]
-                    other_pairs = [p for p in pairs if p.get("dexId") != "pump-fun"]
+                    # Prefer the Pump.fun bonding curve pair specifically.
+                    # DexScreener uses "pumpfun" (no hyphen) as dexId — guard
+                    # against all known variants.
+                    PF_DEX_IDS  = {"pump-fun", "pumpfun", "pump_fun"}
+                    pf_pairs    = [p for p in pairs if p.get("dexId") in PF_DEX_IDS]
+                    other_pairs = [p for p in pairs if p.get("dexId") not in PF_DEX_IDS]
                     if pf_pairs:
                         best = max(pf_pairs,
                                    key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
                     elif other_pairs:
                         best = max(other_pairs,
                                    key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
-                        log.info(f"Pump.fun watcher: {symbol} — no PF pair on DexScreener yet, "
-                                 f"found {best.get('dexId', 'unknown')} pair")
+                        log.info(f"Pump.fun watcher: {symbol} — migrated to "
+                                 f"{best.get('dexId', 'unknown')}, using that pair")
                     else:
                         continue
 
