@@ -1446,6 +1446,7 @@ async def fetch_new_pairs():
                                     or item.get("tokenAddress") or item.get("baseMint")
                                     or item.get("mint") or item.get("address"))
                             if mint and mint not in state["seen_pairs"]: found.append(mint)
+                        found = found[:30]  # cap per-source to avoid hydration flood
                         log.info(f"_discover [{label}]: {len(found)} new mints")
                         return found
                 except asyncio.TimeoutError:
@@ -1454,20 +1455,20 @@ async def fetch_new_pairs():
                     log_error(f"_discover [{label}]", e); return []
             return []
         # ── DexScreener organic new-pair endpoints ──────────────────────────
-        # These return real newly-created pairs, not paid boosts/profiles.
-        # /latest/dex/pairs/solana  — newest Solana pairs by creation time
-        # /token-profiles/latest/v1 — kept as bonus: some legit teams submit profiles
-        # Raydium new-pairs API     — catches tokens that graduate to Raydium AMM
+        # /latest/dex/pairs/solana  — newest Solana pairs by creation time (organic)
+        # /token-profiles/latest/v1 — bonus: teams that submitted a profile
+        # NOTE: Raydium /v2/main/pairs returns ALL historical pairs (thousands) —
+        # too large to hydrate. Raydium graduates are caught via the Raydium WS
+        # listener and the pumpfun watcher migration fallback instead.
         discovered = await asyncio.gather(
             _discover("https://api.dexscreener.com/latest/dex/pairs/solana"),
             _discover("https://api.dexscreener.com/token-profiles/latest/v1"),
-            _discover("https://api.raydium.io/v2/main/pairs"),
         )
         for batch in discovered:
             for mint in batch:
                 if mint not in new_mints: new_mints.append(mint)
         if not new_mints: return []
-        hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:60]])
+        hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:40]])
     return [p for p in hydrated if p is not None]
 
 async def evaluate_new_token(pair, source: str = "dexscreener"):
