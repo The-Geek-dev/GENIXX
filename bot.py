@@ -1428,7 +1428,10 @@ async def fetch_new_pairs():
         timeout=aiohttp.ClientTimeout(total=10, connect=4),
         headers={"Accept": "application/json"}) as session:
         async def _discover(url):
-            label = url.split("/")[-1]
+            # Build a readable label: use query param if present, else last path segment
+            import urllib.parse as _up
+            _qs = _up.parse_qs(_up.urlparse(url).query)
+            label = _qs.get("q", [url.split("/")[-1]])[0]
             for attempt in range(2):
                 try:
                     async with session.get(url) as r:
@@ -1455,13 +1458,14 @@ async def fetch_new_pairs():
                     log_error(f"_discover [{label}]", e); return []
             return []
         # ── DexScreener organic new-pair endpoints ──────────────────────────
-        # /latest/dex/pairs/solana  — newest Solana pairs by creation time (organic)
-        # /token-profiles/latest/v1 — bonus: teams that submitted a profile
-        # NOTE: Raydium /v2/main/pairs returns ALL historical pairs (thousands) —
-        # too large to hydrate. Raydium graduates are caught via the Raydium WS
-        # listener and the pumpfun watcher migration fallback instead.
+        # search?q=solana  — broad search returning latest Solana pairs (organic)
+        # search?q=pump    — specifically catches Pump.fun / PumpPortal tokens
+        # search?q=sol     — catches SOL-paired tokens broadly
+        # token-profiles   — bonus: teams that submitted a profile
         discovered = await asyncio.gather(
-            _discover("https://api.dexscreener.com/latest/dex/pairs/solana"),
+            _discover("https://api.dexscreener.com/latest/dex/search?q=solana"),
+            _discover("https://api.dexscreener.com/latest/dex/search?q=pump"),
+            _discover("https://api.dexscreener.com/latest/dex/search?q=sol"),
             _discover("https://api.dexscreener.com/token-profiles/latest/v1"),
         )
         for batch in discovered:
