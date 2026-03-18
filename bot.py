@@ -252,6 +252,7 @@ state = {
         "min_rugcheck": 500,
         "min_token_age_sec": 120,
         "min_vol5m_pct": 10.0,
+        "min_price_5m_pct": -3.0,   # reject tokens whose 5m price is below this % (e.g. actively dumping)
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
@@ -377,7 +378,8 @@ async def db_load_settings():
                  ("pumpfun_max_wait_sec", 45), ("pumpfun_min_sol_reserve", 30),
                  ("pumpfun_max_watchers", 10), ("pumpfun_eval_min_liq", 8000),
                  ("mg_enabled", True), ("mg_age_max_min", 15.0), ("mg_pump_min_pct", 150.0),
-                 ("mg_buy_ratio", 1.5), ("mg_price5m_min_pct", 5.0)]:
+                 ("mg_buy_ratio", 1.5), ("mg_price5m_min_pct", 5.0),
+                 ("min_price_5m_pct", -3.0)]:
         if k not in s: s[k] = v; changed = True
     if changed: await db_save_settings()
 
@@ -1481,8 +1483,14 @@ async def evaluate_new_token(pair, source: str = "dexscreener"):
         min_liq = s.get("pumpfun_eval_min_liq", s.get("pumpfun_min_liq_usd", 8000))
     else:
         min_liq = s["min_liquidity"]
-    min_age_sec   = s.get("min_token_age_sec", 120)
-    min_vol5m_pct = s.get("min_vol5m_pct", 10.0)
+    # Pump.fun tokens are detected at birth (< 45s old) and have no 5m history yet.
+    # Age, vol5m%, and 5m price-change filters are meaningless at this stage —
+    # bypass them and rely on liq floor, ML, rugcheck, and pump cap instead.
+    is_pumpfun    = source == "pumpfun"
+    min_age_sec   = 0   if is_pumpfun else s.get("min_token_age_sec", 120)
+    min_vol5m_pct = 0.0 if is_pumpfun else s.get("min_vol5m_pct", 10.0)
+
+
     rc_too_risky  = rc_score > s.get("min_rugcheck", RUGCHECK_SCORE_MIN)
     pair_created  = pair.get("pairCreatedAt")
     age_sec       = (time.time()*1000 - pair_created)/1000 if pair_created else 9999
@@ -1522,11 +1530,14 @@ async def evaluate_new_token(pair, source: str = "dexscreener"):
             elif price_5m < mg_p5m:
                 mg_blocked = True
                 mg_reason  = f"mg_price5m={price_5m:.1f}%<{mg_p5m}% (momentum fading)"
+    min_p5m     = s.get("min_price_5m_pct", -3.0)
+    price_5m_ok = True if is_pumpfun else price_5m >= min_p5m
+
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
               and not rc_too_risky and age_sec >= min_age_sec
               and vol5m_pct >= min_vol5m_pct
               and not pump_too_high and not age_too_old
-              and not mg_blocked)
+              and not mg_blocked and price_5m_ok)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1538,6 +1549,7 @@ async def evaluate_new_token(pair, source: str = "dexscreener"):
         if pump_too_high:             reasons.append(f"pump={price_1h:.0f}%>{max_pump:.0f}%")
         if age_too_old:               reasons.append(f"age={age_min:.0f}min>{max_age_min}min")
         if mg_blocked:                reasons.append(f"momentum_gate [{mg_reason}]")
+        if not price_5m_ok:           reasons.append(f"price_5m={price_5m:.1f}%<{min_p5m:.1f}%")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
             "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
