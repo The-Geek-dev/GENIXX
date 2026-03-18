@@ -121,6 +121,7 @@ WAITING_SET_PF_MIN_LIQ           = 59  # pumpfun min liquidity threshold
 WAITING_SET_PF_MAX_WAIT          = 60  # pumpfun max wait seconds
 WAITING_SET_PF_MIN_SOL           = 61  # pumpfun min SOL reserve
 WAITING_SET_PF_MAX_WATCHERS      = 62  # pumpfun max concurrent watchers
+WAITING_SET_PF_EVAL_LIQ          = 63  # pumpfun eval min liquidity floor
 
 def validate_config():
     missing = [k for k, v in {
@@ -239,6 +240,7 @@ state = {
         "pumpfun_max_wait_sec":     45,     # give up if liq not reached in this many seconds
         "pumpfun_min_sol_reserve":  30,     # min SOL in bonding curve to filter instant rugs
         "pumpfun_max_watchers":     10,     # max concurrent liquidity watchers (API rate protection)
+        "pumpfun_eval_min_liq":     8000,   # min liq for evaluate_new_token when source=pumpfun
         # Bot modes
         "auto_snipe": False,
         "demo_mode": False,
@@ -373,7 +375,7 @@ async def db_load_settings():
                  ("turbo_exit_fee_mult", 3),
                  ("pumpfun_enabled", True), ("pumpfun_min_liq_usd", 8000),
                  ("pumpfun_max_wait_sec", 45), ("pumpfun_min_sol_reserve", 30),
-                 ("pumpfun_max_watchers", 10),
+                 ("pumpfun_max_watchers", 10), ("pumpfun_eval_min_liq", 8000),
                  ("mg_enabled", True), ("mg_age_max_min", 15.0), ("mg_pump_min_pct", 150.0),
                  ("mg_buy_ratio", 1.5), ("mg_price5m_min_pct", 5.0)]:
         if k not in s: s[k] = v; changed = True
@@ -654,6 +656,19 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
                 _price_cache[mint] = (time.time(), price)
                 _dead_mints.pop(mint, None)
                 return price
+            # priceUsd missing or zero — derive from marketCap / supply.
+            # Common for very new Pump.fun tokens not yet stabilised on DexScreener.
+            # fdv / totalSupply gives a reliable price for bonding curve tokens.
+            fdv    = float(pair_data.get("fdv") or pair_data.get("marketCap") or 0)
+            supply = float((pair_data.get("baseToken") or {}).get("supply") or 0)
+            if fdv > 0 and supply > 0:
+                price = fdv / supply
+                if price > 0:
+                    state["api_stats"]["price_ok"] += 1
+                    _price_cache[mint] = (time.time(), price)
+                    _dead_mints.pop(mint, None)
+                    log.debug(f"price/pair_data derived from fdv [{mint[:8]}]: ${price:.8f}")
+                    return price
         except Exception:
             pass
 
@@ -1091,15 +1106,18 @@ def kb_pumpfun():
             f"{'🟢' if on else '🔴'} Pump.fun Sniper: {'ON' if on else 'OFF'}",
             callback_data="toggle_pumpfun")],
         [InlineKeyboardButton(
-            f"💧 Min Liq: ${s.get('pumpfun_min_liq_usd', 8000):,.0f}",
+            f"💧 Min Liq (wait): ${s.get('pumpfun_min_liq_usd', 8000):,.0f}",
             callback_data="set_pf_min_liq"),
          InlineKeyboardButton(
             f"⏱ Max Wait: {s.get('pumpfun_max_wait_sec', 45)}s",
             callback_data="set_pf_max_wait")],
         [InlineKeyboardButton(
-            f"◎ Min SOL Reserve: {s.get('pumpfun_min_sol_reserve', 30)}",
-            callback_data="set_pf_min_sol"),
+            f"✅ Min Liq (eval): ${s.get('pumpfun_eval_min_liq', 8000):,.0f}",
+            callback_data="set_pf_eval_liq"),
          InlineKeyboardButton(
+            f"◎ Min SOL: {s.get('pumpfun_min_sol_reserve', 30)}",
+            callback_data="set_pf_min_sol")],
+        [InlineKeyboardButton(
             f"🔄 Max Watchers: {s.get('pumpfun_max_watchers', 10)}",
             callback_data="set_pf_max_watchers")],
         [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu")],
@@ -1443,7 +1461,7 @@ async def fetch_new_pairs():
         hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:40]])
     return [p for p in hydrated if p is not None]
 
-async def evaluate_new_token(pair):
+async def evaluate_new_token(pair, source: str = "dexscreener"):
     base   = pair.get("baseToken") or pair.get("token") or {}
     mint   = base.get("address") or pair.get("tokenAddress", "")
     symbol = base.get("symbol") or pair.get("symbol", "???")
@@ -1456,7 +1474,13 @@ async def evaluate_new_token(pair):
     rugged   = safety.get("rugged", False)
     rc_score = int(safety.get("score", 0) or 0)
     s             = state["settings"]
-    min_liq       = s["min_liquidity"]
+    # Pump.fun tokens use their own liq floor — they're early-stage and won't
+    # have the $30k+ liq that an hour-old DexScreener token would have.
+    # All other filters (ML, rugcheck, pump cap, momentum gate) still apply.
+    if source == "pumpfun":
+        min_liq = s.get("pumpfun_eval_min_liq", s.get("pumpfun_min_liq_usd", 8000))
+    else:
+        min_liq = s["min_liquidity"]
     min_age_sec   = s.get("min_token_age_sec", 120)
     min_vol5m_pct = s.get("min_vol5m_pct", 10.0)
     rc_too_risky  = rc_score > s.get("min_rugcheck", RUGCHECK_SCORE_MIN)
@@ -2315,14 +2339,19 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Connects directly to pumpportal.fun WebSocket.\n"
             f"Finds tokens at birth — seconds after creation — before DexScreener.\n\n"
             f"Status: {'🟢 ON' if on else '🔴 OFF'}\n\n"
-            f"├ Min Liquidity:   ${s.get('pumpfun_min_liq_usd', 8000):,.0f}\n"
-            f"│  _wait until pool reaches this before buying_\n"
+            f"*Watcher settings:*\n"
+            f"├ Min Liq (wait):  ${s.get('pumpfun_min_liq_usd', 8000):,.0f}\n"
+            f"│  _poll until pool reaches this before evaluating_\n"
             f"├ Max Wait:        {s.get('pumpfun_max_wait_sec', 45)}s\n"
-            f"│  _give up if liq threshold not reached in time_\n"
+            f"│  _give up if liq not reached in time_\n"
             f"├ Min SOL Reserve: {s.get('pumpfun_min_sol_reserve', 30)} SOL\n"
-            f"│  _filters near-empty bonding curves = instant rugs_\n"
+            f"│  _filters near-empty bonding curves_\n"
             f"└ Max Watchers:    {s.get('pumpfun_max_watchers', 10)}\n"
-            f"   _concurrent token watchers cap — protects API rate_",
+            f"   _concurrent watchers cap — protects API rate_\n\n"
+            f"*Evaluation settings:*\n"
+            f"└ Min Liq (eval):  ${s.get('pumpfun_eval_min_liq', 8000):,.0f}\n"
+            f"   _replaces global min\\_liquidity (${s.get('min_liquidity', 50000):,.0f}) for Pump.fun tokens_\n"
+            f"   _all other filters still apply normally_",
             parse_mode="Markdown", reply_markup=kb_pumpfun())
 
     elif data == "toggle_pumpfun":
@@ -2337,11 +2366,25 @@ async def _button_handler_inner(update, ctx, q, data):
         ctx.user_data["setting"] = "pumpfun_min_liq_usd"
         cur = state["settings"].get("pumpfun_min_liq_usd", 8000)
         await q.edit_message_text(
-            f"💧 *Pump.fun — Min Liquidity Threshold*\n\nCurrent: ${cur:,.0f}\n\n"
+            f"💧 *Pump.fun — Min Liquidity (Wait Threshold)*\n\nCurrent: ${cur:,.0f}\n\n"
             f"The watcher polls DexScreener until the token's pool reaches this\n"
-            f"USD liquidity before buying. Higher = safer but slower entry.\n"
+            f"USD liquidity before evaluating. Higher = safer but slower entry.\n"
             f"Recommended: $5,000–$15,000\nSend a USD value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PF_MIN_LIQ
+
+    elif data == "set_pf_eval_liq":
+        ctx.user_data["setting"] = "pumpfun_eval_min_liq"
+        cur     = state["settings"].get("pumpfun_eval_min_liq", 8000)
+        global_ = state["settings"].get("min_liquidity", 50000)
+        await q.edit_message_text(
+            f"✅ *Pump.fun — Min Liquidity (Evaluation)*\n\nCurrent: ${cur:,.0f}\n\n"
+            f"This replaces the global min liquidity (${global_:,.0f}) when evaluating\n"
+            f"Pump.fun tokens. Pump.fun tokens are early-stage and won't have\n"
+            f"${global_:,.0f} yet — this allows them through while keeping the\n"
+            f"higher bar for DexScreener tokens.\n\n"
+            f"Should match or be slightly above Min Liq (wait threshold).\n"
+            f"Recommended: $5,000–$15,000\nSend a USD value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PF_EVAL_LIQ
 
     elif data == "set_pf_max_wait":
         ctx.user_data["setting"] = "pumpfun_max_wait_sec"
@@ -2660,7 +2703,7 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "max_hold_minutes","multi_signal_exit_count","stagnation_secs",
                     "priority_fee","max_token_age_min","turbo_exit_fee_mult",
                     "pumpfun_min_liq_usd","pumpfun_max_wait_sec","pumpfun_min_sol_reserve",
-                    "pumpfun_max_watchers")
+                    "pumpfun_max_watchers","pumpfun_eval_min_liq")
         state["settings"][key] = int(val) if key in int_keys else val
         await db_save_settings()
         await update.message.reply_text(f"✅ *{key.replace('_',' ').title()}* updated to `{txt}`",
@@ -2934,11 +2977,28 @@ async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
                              if p.get("chainId") == "solana"]
                     if not pairs:
                         continue
-                    pair = max(pairs,
-                               key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
-                    liq  = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+
+                    # Prefer the Pump.fun bonding curve pair specifically.
+                    # If the token has migrated to Raydium, fall back to the
+                    # highest-liq pair but log it so you can see it happened.
+                    pf_pairs    = [p for p in pairs if p.get("dexId") == "pump-fun"]
+                    other_pairs = [p for p in pairs if p.get("dexId") != "pump-fun"]
+                    if pf_pairs:
+                        best = max(pf_pairs,
+                                   key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                    elif other_pairs:
+                        best = max(other_pairs,
+                                   key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                        log.info(f"Pump.fun watcher: {symbol} — no PF pair on DexScreener yet, "
+                                 f"found {best.get('dexId', 'unknown')} pair")
+                    else:
+                        continue
+
+                    liq = float(best.get("liquidity", {}).get("usd", 0) or 0)
                     if liq >= min_liq:
-                        log.info(f"Pump.fun watcher: {symbol} reached ${liq:,.0f} — evaluating")
+                        pair = best
+                        log.info(f"Pump.fun watcher: {symbol} reached ${liq:,.0f} "
+                                 f"[{best.get('dexId', '?')}] — evaluating")
                         break
                     log.debug(f"Pump.fun watcher: {symbol} liq=${liq:,.0f} < ${min_liq:,.0f}")
             except Exception as e:
@@ -2966,8 +3026,9 @@ async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
             log.info(f"Pump.fun: real limit reached, skipping {symbol}"); return
 
         # Full evaluation — same filters as DexScreener sniper
+        # but uses pumpfun_eval_min_liq instead of global min_liquidity
         try:
-            info = await evaluate_new_token(pair)
+            info = await evaluate_new_token(pair, source="pumpfun")
         except Exception as e:
             log_error(f"pumpfun_watcher/evaluate [{symbol}]", e); return
 
@@ -3034,10 +3095,21 @@ async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
             result = await execute_buy(mint, trade_amt)
             if result:
                 fees = calc_fees(trade_amt)
+                # Derive actual entry price from Jupiter's out_amount — this is
+                # what we really paid, reconciling any DexScreener/Jupiter gap.
+                # out_amount is in raw token units; trade_amt is USDC spent.
+                actual_tokens = result["out_amount"]
+                usdc_spent    = trade_amt - fees["total"]
+                actual_price  = usdc_spent / actual_tokens if actual_tokens > 0 else price
+                if abs(actual_price - price) / max(price, 1e-12) > 0.05:
+                    log.info(f"Pump.fun price reconcile {info['symbol']}: "
+                             f"DexScreener=${price:.8f} Jupiter=${actual_price:.8f} "
+                             f"({(actual_price/price - 1)*100:+.1f}%)")
                 pos  = {
-                    "symbol": info["symbol"], "entry_price": price, "current_price": price,
-                    "peak_price": price, "amount_usd": trade_amt - fees["total"],
-                    "token_amount": result["out_amount"], "fees_paid": fees["total"],
+                    "symbol": info["symbol"], "entry_price": actual_price,
+                    "current_price": actual_price, "peak_price": actual_price,
+                    "amount_usd": usdc_spent,
+                    "token_amount": actual_tokens, "fees_paid": fees["total"],
                     "tp_hit": False, "features": info["features"], "auto": True,
                     "entry_time": time.time(), "peak_vol5m": 0.0,
                     "pt_early_done": False, "source": "pumpfun",
@@ -3088,7 +3160,7 @@ async def raydium_ws_sniper(app):
                                     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
                                         pd = await _fetch_full_pair(sess, part)
                                         if pd:
-                                            info = await evaluate_new_token(pd)
+                                            info = await evaluate_new_token(pd, source="raydium")
                                             if info["passes_rules"]:
                                                 await _handle_snipe(app, part, pd, info)
                     except Exception as e: log_error("raydium_ws/msg", e)
@@ -3199,6 +3271,7 @@ def main():
             WAITING_SET_PF_MAX_WAIT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PF_MIN_SOL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PF_MAX_WATCHERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PF_EVAL_LIQ:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
