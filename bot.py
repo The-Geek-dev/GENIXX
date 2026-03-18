@@ -1472,7 +1472,12 @@ async def evaluate_new_token(pair, source: str = "dexscreener"):
     vol24  = float(pair.get("volume",{}).get("h24",0) or 0)
     features = extract_features(pair)
     ml_score = predict_score(features)
-    safety   = await check_token_safety(mint)
+    # Pump.fun tokens are seconds old — RugCheck won't have indexed them yet.
+    # Skip the API call (saves 5s timeout) and treat as clean/unscored.
+    if source == "pumpfun":
+        safety = {"score": 0, "risks": [], "rugged": False}
+    else:
+        safety = await check_token_safety(mint)
     rugged   = safety.get("rugged", False)
     rc_score = int(safety.get("score", 0) or 0)
     s             = state["settings"]
