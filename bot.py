@@ -237,7 +237,7 @@ state = {
         # after creation, before DexScreener even indexes them.
         "pumpfun_enabled":          True,
         "pumpfun_min_liq_usd":      8000,   # wait until pool reaches this USD liquidity
-        "pumpfun_max_wait_sec":     45,     # give up if liq not reached in this many seconds
+        "pumpfun_max_wait_sec":     180,    # give up if liq not reached in this many seconds
         "pumpfun_min_sol_reserve":  30,     # min SOL in bonding curve to filter instant rugs
         "pumpfun_max_watchers":     10,     # max concurrent liquidity watchers (API rate protection)
         "pumpfun_eval_min_liq":     8000,   # min liq for evaluate_new_token when source=pumpfun
@@ -375,7 +375,7 @@ async def db_load_settings():
                  ("max_pump_pct_risky", 50.0), ("max_token_age_min", 0), ("priority_fee", 20000),
                  ("turbo_exit_fee_mult", 3),
                  ("pumpfun_enabled", True), ("pumpfun_min_liq_usd", 8000),
-                 ("pumpfun_max_wait_sec", 45), ("pumpfun_min_sol_reserve", 30),
+                 ("pumpfun_max_wait_sec", 180), ("pumpfun_min_sol_reserve", 30),
                  ("pumpfun_max_watchers", 10), ("pumpfun_eval_min_liq", 8000),
                  ("mg_enabled", True), ("mg_age_max_min", 15.0), ("mg_pump_min_pct", 150.0),
                  ("mg_buy_ratio", 1.5), ("mg_price5m_min_pct", 5.0),
@@ -1111,7 +1111,7 @@ def kb_pumpfun():
             f"💧 Min Liq (wait): ${s.get('pumpfun_min_liq_usd', 8000):,.0f}",
             callback_data="set_pf_min_liq"),
          InlineKeyboardButton(
-            f"⏱ Max Wait: {s.get('pumpfun_max_wait_sec', 45)}s",
+            f"⏱ Max Wait: {s.get('pumpfun_max_wait_sec', 180)}s",
             callback_data="set_pf_max_wait")],
         [InlineKeyboardButton(
             f"✅ Min Liq (eval): ${s.get('pumpfun_eval_min_liq', 8000):,.0f}",
@@ -1434,14 +1434,17 @@ async def fetch_new_pairs():
                     async with session.get(url) as r:
                         if r.status != 200: return []
                         data  = await r.json()
-                        items = data if isinstance(data, list) else (data.get("pairs") or [])
+                        # Raydium wraps pairs in "data" key; DexScreener uses "pairs"
+                        items = (data if isinstance(data, list)
+                                 else (data.get("pairs") or data.get("data") or []))
                         found = []
                         for item in items:
                             if not isinstance(item, dict): continue
                             chain = item.get("chainId") or item.get("chain", "")
                             if chain and chain != "solana": continue
                             mint = ((item.get("baseToken") or item.get("token") or {}).get("address")
-                                    or item.get("tokenAddress") or item.get("mint") or item.get("address"))
+                                    or item.get("tokenAddress") or item.get("baseMint")
+                                    or item.get("mint") or item.get("address"))
                             if mint and mint not in state["seen_pairs"]: found.append(mint)
                         log.info(f"_discover [{label}]: {len(found)} new mints")
                         return found
@@ -1450,17 +1453,21 @@ async def fetch_new_pairs():
                 except Exception as e:
                     log_error(f"_discover [{label}]", e); return []
             return []
+        # ── DexScreener organic new-pair endpoints ──────────────────────────
+        # These return real newly-created pairs, not paid boosts/profiles.
+        # /latest/dex/pairs/solana  — newest Solana pairs by creation time
+        # /token-profiles/latest/v1 — kept as bonus: some legit teams submit profiles
+        # Raydium new-pairs API     — catches tokens that graduate to Raydium AMM
         discovered = await asyncio.gather(
+            _discover("https://api.dexscreener.com/latest/dex/pairs/solana"),
             _discover("https://api.dexscreener.com/token-profiles/latest/v1"),
-            _discover("https://api.dexscreener.com/token-boosts/latest/v1"),
-            _discover("https://api.dexscreener.com/orders/v1/solana"),
-            _discover("https://api.dexscreener.com/token-boosts/top/v1"),
+            _discover("https://api.raydium.io/v2/main/pairs"),
         )
         for batch in discovered:
             for mint in batch:
                 if mint not in new_mints: new_mints.append(mint)
         if not new_mints: return []
-        hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:40]])
+        hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:60]])
     return [p for p in hydrated if p is not None]
 
 async def evaluate_new_token(pair, source: str = "dexscreener"):
@@ -2359,7 +2366,7 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Status: {'🟢 ON' if on else '🔴 OFF'}\n\n"
             f"*Watcher settings:*\n"
             f"├ Min Liq (wait):  ${s.get('pumpfun_min_liq_usd', 8000):,.0f}\n"
-            f"├ Max Wait:        {s.get('pumpfun_max_wait_sec', 45)}s\n"
+            f"├ Max Wait:        {s.get('pumpfun_max_wait_sec', 180)}s\n"
             f"├ Min SOL Reserve: {s.get('pumpfun_min_sol_reserve', 30)} SOL\n"
             f"└ Max Watchers:    {s.get('pumpfun_max_watchers', 10)}\n\n"
             f"*Evaluation settings:*\n"
@@ -2402,7 +2409,7 @@ async def _button_handler_inner(update, ctx, q, data):
 
     elif data == "set_pf_max_wait":
         ctx.user_data["setting"] = "pumpfun_max_wait_sec"
-        cur = state["settings"].get("pumpfun_max_wait_sec", 45)
+        cur = state["settings"].get("pumpfun_max_wait_sec", 180)
         await q.edit_message_text(
             f"⏱ *Pump.fun — Max Wait Time*\n\nCurrent: {cur}s\n\n"
             f"If the liquidity threshold isn't reached within this many seconds\n"
@@ -2970,14 +2977,14 @@ async def _pumpfun_liquidity_watcher(app, mint, symbol, sem: asyncio.Semaphore):
     async with sem:   # holds one slot for the full lifetime of this watcher
         s          = state["settings"]
         min_liq    = s.get("pumpfun_min_liq_usd", 8000)
-        max_wait   = s.get("pumpfun_max_wait_sec", 45)
+        max_wait   = s.get("pumpfun_max_wait_sec", 180)
         start_time = time.time()
 
         log.info(f"Pump.fun watcher: {symbol} [{mint[:8]}] — waiting for ${min_liq:,.0f} liq")
 
         pair = None
         while time.time() - start_time < max_wait:
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             try:
                 sess = await _get_session()
                 async with sess.get(
