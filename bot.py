@@ -106,6 +106,12 @@ WAITING_SET_MULTI_SIGNAL_CNT = 45
 WAITING_SET_PRE_TP_TRAIL     = 46  # pre-TP fast trailing stop %
 WAITING_SET_PRE_TP_TRAIL_ACT = 47  # activation threshold (e.g. 1.1x)
 WAITING_SET_PRIORITY_FEE     = 48  # priority fee in microlamports
+WAITING_SET_PRICE5M_FILTER_AGE = 49  # 5m price filter age threshold (minutes input)
+WAITING_SET_PRICE5M_YOUNG_PCT   = 50  # 5m min % for young tokens
+WAITING_SET_PRICE5M_OLD_PCT     = 51  # 5m min % for old tokens
+WAITING_SET_MAX_TOKEN_AGE        = 52  # max token age in minutes
+WAITING_SET_PRICE1H_FILTER_AGE  = 53  # 1h price filter age threshold (minutes)
+WAITING_SET_PRICE1H_OLD_PCT      = 54  # 1h min % for old tokens
 
 def validate_config():
     missing = [k for k, v in {
@@ -147,6 +153,7 @@ state = {
         "swap_ok": 0,  "swap_fail": 0,
         "confirm_ok": 0, "confirm_timeout": 0,
         "rpc_reconnects": 0,
+        "price_alert_sent": False,   # tracks whether a price health alert is outstanding
     },
     "settings": {
         # Core trading
@@ -169,7 +176,13 @@ state = {
         "min_score": 0.5,
         "min_rugcheck": 500,
         "min_token_age_sec": 120,
+        "max_token_age_sec": 14400,   # 240 min — reject tokens older than this (0 = disabled)
         "min_vol5m_pct": 10.0,
+        "price5m_filter_min_age_sec": 3600,  # apply 5m price filter only to tokens older than this (seconds)
+        "price5m_young_min_pct": -5.0,    # min 5m % for tokens YOUNGER than age threshold (relaxed, allows small dips)
+        "price5m_old_min_pct":   1.0,    # min 5m % for tokens OLDER than age threshold (must be actively rising)
+        "price1h_filter_min_age_sec": 1800,  # apply 1h trend filter only to tokens older than this (seconds)
+        "price1h_old_min_pct":  -10.0,   # reject old tokens with 1h change below this (e.g. -10% = strong dump guard)
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
@@ -229,6 +242,7 @@ state = {
     "daily_pnl_date": "",
     "sniper_paused_until": 0.0,
     "recent_losses": {},
+    "bought_mints": set(),   # permanent set — never re-buy a token we've traded
 }
 
 # ============================================================
@@ -517,20 +531,87 @@ async def _safe_notify(app, text):
 # TOKEN DATA & PRICING
 # ============================================================
 _price_cache: dict = {}
-_PRICE_CACHE_TTL      = 7.5
-_PRICE_CACHE_FAIL_TTL = 3.0
+_PRICE_CACHE_TTL      = 12.0   # extended: reduces re-fetch frequency for active positions
+_PRICE_CACHE_FAIL_TTL = 5.0    # wait longer before retrying a failed mint
 _rugcheck_cache: dict = {}
 _RUGCHECK_CACHE_TTL   = 300
 
+# ── Per-source circuit breakers ───────────────────────────────────────────────
+# Each entry: (backoff_until_timestamp, consecutive_failures)
+# A source is "open" (skipped) until its backoff_until time passes.
+_src_circuit: dict = {
+    "jup_v2":    [0.0, 0],
+    "dexscreen": [0.0, 0],
+    "jup_quote": [0.0, 0],
+    "gecko":     [0.0, 0],
+}
+_SRC_BACKOFF_SECS = [0, 10, 30, 60, 120]  # progressive backoff per consecutive fail
+
+def _src_ok(name: str) -> bool:
+    """Return True if source circuit is closed (allowed to call)."""
+    return time.time() >= _src_circuit[name][0]
+
+def _src_success(name: str):
+    _src_circuit[name][0] = 0.0
+    _src_circuit[name][1] = 0
+
+def _src_fail(name: str):
+    fails = _src_circuit[name][1] + 1
+    _src_circuit[name][1] = fails
+    idx    = min(fails, len(_SRC_BACKOFF_SECS) - 1)
+    delay  = _SRC_BACKOFF_SECS[idx]
+    _src_circuit[name][0] = time.time() + delay
+    if delay > 0:
+        log.warning(f"price/{name}: circuit open for {delay}s (fail #{fails})")
+
+# ── Batch Jupiter price fetch — ONE call for ALL mints ────────────────────────
+async def batch_jupiter_prices(mints: list[str]) -> dict[str, float]:
+    """
+    Fetch prices for multiple mints in a single Jupiter API call.
+    Returns {mint: price} for successful lookups.
+    """
+    if not mints or not _src_ok("jup_v2"):
+        return {}
+    try:
+        sess = await _get_session()
+        ids  = ",".join(mints)
+        async with sess.get(
+            JUPITER_PRICE_API,
+            params={"ids": ids, "showExtraInfo": "false"},
+            timeout=aiohttp.ClientTimeout(total=6),
+        ) as r:
+            if r.status == 429:
+                _src_fail("jup_v2")
+                log.warning("Jupiter Price API rate-limited (batch)")
+                return {}
+            if r.status == 200:
+                data   = (await r.json()).get("data", {}) or {}
+                result = {}
+                now    = time.time()
+                for mint in mints:
+                    raw   = data.get(mint, {}) or {}
+                    price = float(raw.get("price") or 0)
+                    if price > 0:
+                        result[mint] = price
+                        _price_cache[mint] = (now, price)
+                if result:
+                    _src_success("jup_v2")
+                return result
+    except Exception as e:
+        _src_fail("jup_v2")
+        log.debug(f"batch_jupiter_prices error: {e}")
+    return {}
+
 async def get_token_price(mint: str, pair_data: dict = None) -> float:
     """
-    Fetch token price with a 4-source fallback chain for maximum reliability.
-    Sources tried in order:
-      1. Caller-supplied pair_data  (free, instant)
-      2. Jupiter Price API v2       (primary live source)
-      3. DexScreener                (independent fallback)
-      4. Jupiter Quote API          (derive price from tiny swap quote)
-    Returns 0.0 only when all sources fail.
+    Fetch token price with a 4-source fallback chain and circuit breakers.
+    Sources tried in order (skipped if circuit is open due to rate limiting):
+      1. Caller-supplied pair_data  (free, instant — always tried first)
+      2. Jupiter Price API v2       (primary; circuit breaker protected)
+      3. DexScreener                (independent fallback; circuit breaker protected)
+      4. Jupiter Quote API          (derive price from quote; circuit breaker protected)
+      5. GeckoTerminal              (last resort; circuit breaker protected)
+    Returns 0.0 only when all available sources fail.
     """
     # Fast path: caller already has fresh pair data (e.g. from sniper loop)
     if pair_data:
@@ -544,90 +625,117 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
             pass
 
     now = time.time()
-    # Short-circuit on fresh cached value
+    # Short-circuit on fresh cached value — avoids hammering APIs
     if mint in _price_cache:
         ts, p = _price_cache[mint]
-        if p > 0 and now - ts < _PRICE_CACHE_TTL:     return p
+        if p > 0 and now - ts < _PRICE_CACHE_TTL:         return p
         if p == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL: return 0.0
 
     sess = await _get_session()
     _T5  = aiohttp.ClientTimeout(total=5)
 
     # ── Source 1: Jupiter Price API v2 ───────────────────────────────────────
-    try:
-        async with sess.get(
-            JUPITER_PRICE_API,
-            params={"ids": mint, "showExtraInfo": "false"},
-            timeout=_T5,
-        ) as r:
-            if r.status == 200:
-                raw   = (await r.json()).get("data", {}).get(mint, {}) or {}
-                price = float(raw.get("price") or 0)
-                if price > 0:
-                    state["api_stats"]["price_ok"] += 1
-                    _price_cache[mint] = (now, price)
-                    return price
-    except Exception as e:
-        log.debug(f"price/jup_v2 miss [{mint[:8]}]: {e}")
-
-    # ── Source 2: DexScreener ─────────────────────────────────────────────────
-    try:
-        async with sess.get(
-            f"{DEXSCREENER_API}{mint}",
-            timeout=_T5,
-        ) as r:
-            if r.status == 200:
-                pairs = [p for p in ((await r.json()).get("pairs") or []) if p.get("chainId") == "solana"]
-                if pairs:
-                    pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
-                    price = float(pairs[0].get("priceUsd", 0) or 0)
+    if _src_ok("jup_v2"):
+        try:
+            async with sess.get(
+                JUPITER_PRICE_API,
+                params={"ids": mint, "showExtraInfo": "false"},
+                timeout=_T5,
+            ) as r:
+                if r.status == 429:
+                    _src_fail("jup_v2")
+                    log.warning(f"Jupiter v2 rate-limited [{mint[:8]}]")
+                elif r.status == 200:
+                    raw   = (await r.json()).get("data", {}).get(mint, {}) or {}
+                    price = float(raw.get("price") or 0)
                     if price > 0:
+                        _src_success("jup_v2")
                         state["api_stats"]["price_ok"] += 1
                         _price_cache[mint] = (now, price)
-                        log.debug(f"price/dexscreener fallback OK [{mint[:8]}]")
                         return price
-            elif r.status == 429:
-                log.warning("DexScreener rate-limited on price fallback")
-    except Exception as e:
-        log.debug(f"price/dexscreener miss [{mint[:8]}]: {e}")
+        except Exception as e:
+            _src_fail("jup_v2")
+            log.debug(f"price/jup_v2 miss [{mint[:8]}]: {e}")
+    else:
+        log.debug(f"price/jup_v2 skipped (circuit open) [{mint[:8]}]")
 
-    # ── Source 3: Jupiter Quote API (derive price from tiny USDC→token quote) ─
-    try:
-        async with sess.get(
-            JUPITER_QUOTE_API,
-            params={"inputMint": USDC_MINT, "outputMint": mint,
-                    "amount": 1_000_000, "slippageBps": 500},
-            timeout=_T5,
-        ) as r:
-            if r.status == 200:
-                q        = await r.json()
-                out      = int(q.get("outAmount", 0))
-                decimals = int(q.get("outputDecimals", 6))
-                if out > 0:
-                    price = 1.0 / (out / (10 ** decimals))
-                    state["api_stats"]["price_ok"] += 1
-                    _price_cache[mint] = (now, price)
-                    log.debug(f"price/quote_fallback OK [{mint[:8]}]")
-                    return price
-    except Exception as e:
-        log.debug(f"price/quote_fallback miss [{mint[:8]}]: {e}")
+    # ── Source 2: DexScreener ─────────────────────────────────────────────────
+    if _src_ok("dexscreen"):
+        try:
+            async with sess.get(f"{DEXSCREENER_API}{mint}", timeout=_T5) as r:
+                if r.status == 429:
+                    _src_fail("dexscreen")
+                    log.warning(f"DexScreener rate-limited [{mint[:8]}]")
+                elif r.status == 200:
+                    pairs = [p for p in ((await r.json()).get("pairs") or []) if p.get("chainId") == "solana"]
+                    if pairs:
+                        pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
+                        price = float(pairs[0].get("priceUsd", 0) or 0)
+                        if price > 0:
+                            _src_success("dexscreen")
+                            state["api_stats"]["price_ok"] += 1
+                            _price_cache[mint] = (now, price)
+                            log.debug(f"price/dexscreener fallback OK [{mint[:8]}]")
+                            return price
+        except Exception as e:
+            _src_fail("dexscreen")
+            log.debug(f"price/dexscreener miss [{mint[:8]}]: {e}")
+    else:
+        log.debug(f"price/dexscreen skipped (circuit open) [{mint[:8]}]")
+
+    # ── Source 3: Jupiter Quote API ───────────────────────────────────────────
+    if _src_ok("jup_quote"):
+        try:
+            async with sess.get(
+                JUPITER_QUOTE_API,
+                params={"inputMint": USDC_MINT, "outputMint": mint,
+                        "amount": 1_000_000, "slippageBps": 500},
+                timeout=_T5,
+            ) as r:
+                if r.status == 429:
+                    _src_fail("jup_quote")
+                    log.warning(f"Jupiter Quote rate-limited [{mint[:8]}]")
+                elif r.status == 200:
+                    q        = await r.json()
+                    out      = int(q.get("outAmount", 0))
+                    decimals = int(q.get("outputDecimals", 6))
+                    if out > 0:
+                        price = 1.0 / (out / (10 ** decimals))
+                        _src_success("jup_quote")
+                        state["api_stats"]["price_ok"] += 1
+                        _price_cache[mint] = (now, price)
+                        log.debug(f"price/quote_fallback OK [{mint[:8]}]")
+                        return price
+        except Exception as e:
+            _src_fail("jup_quote")
+            log.debug(f"price/quote_fallback miss [{mint[:8]}]: {e}")
+    else:
+        log.debug(f"price/jup_quote skipped (circuit open) [{mint[:8]}]")
 
     # ── Source 4: GeckoTerminal ───────────────────────────────────────────────
-    try:
-        async with sess.get(
-            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
-            headers={"Accept": "application/json"},
-            timeout=_T5,
-        ) as r:
-            if r.status == 200:
-                price = float((await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0)
-                if price > 0:
-                    state["api_stats"]["price_ok"] += 1
-                    _price_cache[mint] = (now, price)
-                    log.debug(f"price/gecko fallback OK [{mint[:8]}]")
-                    return price
-    except Exception as e:
-        log.debug(f"price/gecko miss [{mint[:8]}]: {e}")
+    if _src_ok("gecko"):
+        try:
+            async with sess.get(
+                f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
+                headers={"Accept": "application/json"},
+                timeout=_T5,
+            ) as r:
+                if r.status == 429:
+                    _src_fail("gecko")
+                    log.warning(f"GeckoTerminal rate-limited [{mint[:8]}]")
+                elif r.status == 200:
+                    price = float((await r.json()).get("data", {}).get("attributes", {}).get("price_usd") or 0)
+                    if price > 0:
+                        _src_success("gecko")
+                        state["api_stats"]["price_ok"] += 1
+                        _price_cache[mint] = (now, price)
+                        log.debug(f"price/gecko fallback OK [{mint[:8]}]")
+                        return price
+        except Exception as e:
+            _src_fail("gecko")
+            log.debug(f"price/gecko miss [{mint[:8]}]: {e}")
+    else:
+        log.debug(f"price/gecko skipped (circuit open) [{mint[:8]}]")
 
     state["api_stats"]["price_fail"] += 1
     _price_cache[mint] = (now, 0.0)
@@ -651,7 +759,7 @@ async def check_token_safety(mint):
         ts, result = _rugcheck_cache[mint]
         if now - ts < _RUGCHECK_CACHE_TTL: return result
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as s:
             async with s.get(RUGCHECK_API.format(mint)) as r:
                 if r.status == 429:
                     log.warning("RugCheck rate limited — using safe default")
@@ -837,6 +945,12 @@ def kb_settings():
          InlineKeyboardButton(f"🛡️ Max Rug: {s['min_rugcheck']}",             callback_data="set_rugcheck")],
         [InlineKeyboardButton(f"⏱ Min Age: {s.get('min_token_age_sec',120)}s", callback_data="set_min_age"),
          InlineKeyboardButton(f"📊 Vol5m≥: {s.get('min_vol5m_pct',10)}% liq", callback_data="set_vol5m")],
+        [InlineKeyboardButton(f"🔝 Max Age: {'OFF' if not s.get('max_token_age_sec',0) else str(s.get('max_token_age_sec',0)//60)+'min'}", callback_data="set_max_token_age")],
+        [InlineKeyboardButton(f"⏳ 5m Age Split: {s.get('price5m_filter_min_age_sec',3600)//60}min", callback_data="set_price5m_filter_age")],
+        [InlineKeyboardButton(f"🟢 Young(<split) 5m≥: {s.get('price5m_young_min_pct',-5.0):+.1f}%", callback_data="set_price5m_young_pct"),
+         InlineKeyboardButton(f"🔵 Old(>split) 5m≥: {s.get('price5m_old_min_pct',1.0):+.1f}%", callback_data="set_price5m_old_pct")],
+        [InlineKeyboardButton(f"📉 1h Dump Guard Age: {s.get('price1h_filter_min_age_sec',1800)//60}min", callback_data="set_price1h_filter_age"),
+         InlineKeyboardButton(f"📉 1h Min%: {s.get('price1h_old_min_pct',-10.0):+.1f}%", callback_data="set_price1h_old_pct")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
         [InlineKeyboardButton(hm,  callback_data="toggle_house_money"),
@@ -1210,17 +1324,49 @@ async def fetch_new_pairs():
                 except Exception as e:
                     log_error(f"_discover [{label}]", e); return []
             return []
-        discovered = await asyncio.gather(
+        # ── Discovery sources ────────────────────────────────────────────────
+        # DexScreener standard endpoints
+        dexscreener_tasks = [
             _discover("https://api.dexscreener.com/token-profiles/latest/v1"),
             _discover("https://api.dexscreener.com/token-boosts/latest/v1"),
             _discover("https://api.dexscreener.com/orders/v1/solana"),
             _discover("https://api.dexscreener.com/token-boosts/top/v1"),
-        )
+        ]
+        # DexScreener new-pairs search — sorted by creation time, Solana only
+        # These endpoints surface coins in their first few minutes/hours of trading
+        async def _discover_new_pairs():
+            found = []
+            try:
+                urls = [
+                    "https://api.dexscreener.com/latest/dex/search?q=sol&sort=createdAt&order=desc",
+                    "https://api.dexscreener.com/latest/dex/pairs/solana",
+                ]
+                for url in urls:
+                    try:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                            if r.status != 200: continue
+                            data  = await r.json()
+                            items = data if isinstance(data, list) else (data.get("pairs") or [])
+                            for item in items:
+                                if not isinstance(item, dict): continue
+                                if item.get("chainId") != "solana": continue
+                                mint = (item.get("baseToken") or {}).get("address")
+                                if mint and mint not in state["seen_pairs"] and mint not in found:
+                                    found.append(mint)
+                    except Exception as e:
+                        log_error("_discover_new_pairs/url", e)
+            except Exception as e:
+                log_error("_discover_new_pairs", e)
+            log.info(f"_discover [new-pairs]: {len(found)} new mints")
+            return found
+
+        discovered = await asyncio.gather(*dexscreener_tasks, _discover_new_pairs())
         for batch in discovered:
             for mint in batch:
                 if mint not in new_mints: new_mints.append(mint)
         if not new_mints: return []
-        hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:40]])
+        # Raised from 40 → 80 to process more tokens per loop
+        hydrated = await asyncio.gather(*[_fetch_full_pair(session, m) for m in new_mints[:80]])
     return [p for p in hydrated if p is not None]
 
 async def evaluate_new_token(pair):
@@ -1243,9 +1389,36 @@ async def evaluate_new_token(pair):
     rc_too_risky  = rc_score > s.get("min_rugcheck", RUGCHECK_SCORE_MIN)
     pair_created  = pair.get("pairCreatedAt")
     age_sec       = (time.time()*1000 - pair_created)/1000 if pair_created else 9999
-    vol5m_pct     = (vol5m / liq * 100) if liq > 0 else 0
+    vol5m_pct              = (vol5m / liq * 100) if liq > 0 else 0
+    price_5m               = float(pair.get("priceChange",{}).get("m5",0) or 0)
+    price_1h               = float(pair.get("priceChange",{}).get("h1",0) or 0)
+
+    # ── 5m price filter (young vs old split) ─────────────────────────────────
+    price5m_filter_age_sec = s.get("price5m_filter_min_age_sec", 3600)
+    price5m_young_min_pct  = s.get("price5m_young_min_pct", -5.0)
+    price5m_old_min_pct    = s.get("price5m_old_min_pct", 1.0)
+    if age_sec >= price5m_filter_age_sec:
+        price5m_min_pct = price5m_old_min_pct
+    else:
+        price5m_min_pct = price5m_young_min_pct
+    price5m_fails = (price_5m < price5m_min_pct)
+
+    # ── Max token age filter — keeps bot focused on fresh/young coins ─────────
+    max_age_sec  = s.get("max_token_age_sec", 0)  # 0 = disabled
+    age_too_old  = (max_age_sec > 0 and age_sec > max_age_sec)
+
+    # ── 1h trend guard — avoid buying into established downtrends ─────────────
+    price1h_filter_age_sec = s.get("price1h_filter_min_age_sec", 1800)
+    price1h_old_min_pct    = s.get("price1h_old_min_pct", -10.0)
+    # Only apply to tokens old enough to have a meaningful 1h candle
+    if age_sec >= price1h_filter_age_sec:
+        price1h_fails = (price_1h < price1h_old_min_pct)
+    else:
+        price1h_fails = False
+
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
-              and not rc_too_risky and age_sec >= min_age_sec and vol5m_pct >= min_vol5m_pct)
+              and not rc_too_risky and age_sec >= min_age_sec and vol5m_pct >= min_vol5m_pct
+              and not price5m_fails and not age_too_old and not price1h_fails)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1253,10 +1426,17 @@ async def evaluate_new_token(pair):
         if rugged:                    reasons.append("rugged")
         if rc_too_risky:              reasons.append(f"rug={rc_score}")
         if age_sec < min_age_sec:     reasons.append(f"age={age_sec:.0f}s<{min_age_sec}s")
+        if age_too_old:               reasons.append(f"age={age_sec/60:.0f}min>{max_age_sec//60}min (too old)")
         if vol5m_pct < min_vol5m_pct: reasons.append(f"vol5m={vol5m_pct:.1f}%<{min_vol5m_pct}%")
+        if price5m_fails:
+            bracket = f"old(>{price5m_filter_age_sec//60}min)" if age_sec >= price5m_filter_age_sec else f"young(<{price5m_filter_age_sec//60}min)"
+            reasons.append(f"price5m={price_5m:.1f}%<{price5m_min_pct:.1f}% required [{bracket}]")
+        if price1h_fails:
+            reasons.append(f"price1h={price_1h:.1f}%<{price1h_old_min_pct:.1f}% (1h dump guard)")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
             "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
+            "price_5m": price_5m, "price_1h": price_1h,
             "market_cap": float(pair.get("marketCap",0) or 0),
             "price_change": float(pair.get("priceChange",{}).get("h1",0) or 0),
             "ml_score": ml_score, "safety": safety, "rc_score": rc_score,
@@ -1279,8 +1459,16 @@ async def auto_sniper_loop(app):
             for pair in new_pairs:
                 base = pair.get("baseToken") or pair.get("token") or {}
                 mint = base.get("address") or pair.get("tokenAddress","")
-                if not mint or mint in state["seen_pairs"]: continue
-                state["seen_pairs"][mint] = time.time()
+                if not mint: continue
+                # Skip tokens already in an open position
+                if mint in state["positions"] or mint in state["demo_positions"]: continue
+                # Skip tokens we've already bought (permanent record)
+                if mint in state.get("bought_mints", set()): continue
+                # Short cooldown: re-evaluate tokens every 3 minutes instead of locking for 2h
+                now_t = time.time()
+                last_eval = state["seen_pairs"].get(mint, 0)
+                if now_t - last_eval < 180: continue   # 3-minute re-eval cooldown
+                state["seen_pairs"][mint] = now_t
                 new_tokens.append((mint, pair))
             if not new_tokens: await asyncio.sleep(2); continue
             infos = await asyncio.gather(*[evaluate_new_token(p) for _,p in new_tokens], return_exceptions=True)
@@ -1315,6 +1503,7 @@ async def auto_sniper_loop(app):
                     f"├ Vol5m:      ${info.get('vol5m',0):,.0f} ({info.get('vol5m_pct',0):.1f}% of liq)\n"
                     f"├ Age:        {age_min:.1f} min\n"
                     f"├ Market Cap: ${info['market_cap']:,.0f}\n"
+                    f"├ Price 5m:   {info.get('price_5m',0):+.1f}%\n"
                     f"├ Price 1h:   {info['price_change']:+.1f}%\n"
                     f"├ ML Score:   {info['ml_score']:.0%} confidence\n"
                     f"├ RugCheck:   {info['rc_score']} (lower=safer)\n"
@@ -1331,6 +1520,7 @@ async def auto_sniper_loop(app):
                             "auto": True, "entry_time": time.time(), "peak_vol5m": 0.0,
                             "pt_early_done": False}
                     state["demo_positions"][mint] = pos
+                    state["bought_mints"].add(mint)
                     await db_save_position(mint, pos, True)
                     await _safe_notify(app, notif + f"\n📝 *DEMO Auto-bought @ ${price:.6f}*")
                 elif s["auto_snipe"]:
@@ -1353,6 +1543,7 @@ async def auto_sniper_loop(app):
                                 "entry_time": time.time(), "peak_vol5m": 0.0,
                                 "pt_early_done": False}
                         state["positions"][mint] = pos
+                        state["bought_mints"].add(mint)
                         await db_save_position(mint, pos, False)
                         await _safe_notify(app, f"✅ *Sniped {info['symbol']}!*\nEntry: ${price:.6f}\n"
                             f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})")
@@ -1362,7 +1553,7 @@ async def auto_sniper_loop(app):
             consecutive_errors += 1; log_error("auto_sniper_loop", e)
             if consecutive_errors >= 5:
                 await notify_error(app, "auto_sniper_loop (5x)", e); consecutive_errors = 0
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)  # was 2s — tighter loop = faster sniping
 
 # ============================================================
 # POSITION MONITOR
@@ -1382,11 +1573,47 @@ async def monitor_positions(app):
 
     while True:
         await asyncio.sleep(0.5)
+
+        # ── Real-time price health watchdog ─────────────────────────────────
+        a  = state["api_stats"]
+        pt = a["price_ok"] + a["price_fail"]
+        if pt >= 20:   # only evaluate once we have meaningful sample size
+            health_pct = a["price_ok"] / pt
+            if health_pct < 0.90 and not a.get("price_alert_sent"):
+                # Identify which sources are currently rate-limited
+                open_circuits = [k for k, v in _src_circuit.items() if time.time() < v[0]]
+                src_txt = ", ".join(open_circuits) if open_circuits else "unknown"
+                await _safe_notify(app,
+                    f"⚠️ *Price Health Warning*\n\n"
+                    f"Price success rate dropped to *{health_pct:.0%}* ({a['price_ok']}/{pt})\n"
+                    f"Rate-limited sources: `{src_txt}`\n\n"
+                    f"Bot will use cached prices & fallback sources.\n"
+                    f"Exits may be delayed — monitor positions closely.")
+                a["price_alert_sent"] = True
+                log.warning(f"Price health alert sent: {health_pct:.0%} | circuits: {open_circuits}")
+            elif health_pct >= 0.95 and a.get("price_alert_sent"):
+                # Clear alert once health recovers
+                await _safe_notify(app,
+                    f"✅ *Price Health Restored*\n\nSuccess rate back to *{health_pct:.0%}* — all sources operational.")
+                a["price_alert_sent"] = False
+                log.info(f"Price health recovered: {health_pct:.0%}")
         for is_demo, pool in [(False, state["positions"]), (True, state["demo_positions"])]:
             mints = list(pool.keys())
             if not mints: continue
-            price_results = await asyncio.gather(*[get_token_price(m) for m in mints], return_exceptions=True)
-            price_map = {m: (p if isinstance(p, float) and p > 0 else 0.0) for m, p in zip(mints, price_results)}
+
+            # ── Batch price fetch: one Jupiter call for all positions ─────────
+            # Falls back to individual get_token_price only for mints that miss
+            price_map: dict[str, float] = {}
+            batch_result = await batch_jupiter_prices(mints)
+            price_map.update(batch_result)
+            # Individual fallback for any mint not returned by batch
+            missing = [m for m in mints if m not in price_map or price_map[m] <= 0]
+            if missing:
+                fallback_results = await asyncio.gather(
+                    *[get_token_price(m) for m in missing], return_exceptions=True)
+                for m, p in zip(missing, fallback_results):
+                    if isinstance(p, float) and p > 0:
+                        price_map[m] = p
 
             for mint, pos in list(pool.items()):
                 try:
@@ -1884,6 +2111,56 @@ async def _button_handler_inner(update, ctx, q, data):
         await q.edit_message_text(f"⚡ *Exit Slippage*\nCurrent: {cur}bps\n\nSend new bps (100 = 1%):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_EXIT_SLIP
 
+    elif data == "set_price5m_young_pct":
+        ctx.user_data["setting"] = "price5m_young_min_pct"
+        cur = state["settings"].get("price5m_young_min_pct", -5.0)
+        age_min = state["settings"].get("price5m_filter_min_age_sec", 3600) // 60
+        await q.edit_message_text(
+            f"🟢 *Young Token 5m Min % (< {age_min} min old)*\n\n"
+            f"Current: *{cur:+.1f}%*\n\n"
+            f"Applies to tokens *younger* than {age_min} min.\n"
+            f"New tokens can dip early and still pump, so this is typically more relaxed.\n\n"
+            f"Examples:\n"
+            f"• `-5` = allows up to -5% dip (recommended for new tokens)\n"
+            f"• `-10` = allows bigger dips\n"
+            f"• `0` = must be flat or rising\n"
+            f"• `1` = must be actively rising\n\n"
+            f"Send a value:",
+            parse_mode="Markdown", reply_markup=kb_back())
+        return WAITING_SET_PRICE5M_YOUNG_PCT
+
+    elif data == "set_price5m_old_pct":
+        ctx.user_data["setting"] = "price5m_old_min_pct"
+        cur = state["settings"].get("price5m_old_min_pct", 1.0)
+        age_min = state["settings"].get("price5m_filter_min_age_sec", 3600) // 60
+        await q.edit_message_text(
+            f"🔵 *Old Token 5m Min % (> {age_min} min old)*\n\n"
+            f"Current: *{cur:+.1f}%*\n\n"
+            f"Applies to tokens *older* than {age_min} min.\n"
+            f"Older tokens with falling 5m momentum are likely reversing — this filter blocks them.\n\n"
+            f"Examples:\n"
+            f"• `1` = must be up at least 1% in the last 5 min (recommended)\n"
+            f"• `3` = strong upward momentum required\n"
+            f"• `0` = just needs to be flat or rising\n"
+            f"• `-2` = allows a small dip\n\n"
+            f"Send a value:",
+            parse_mode="Markdown", reply_markup=kb_back())
+        return WAITING_SET_PRICE5M_OLD_PCT
+
+    elif data == "set_price5m_filter_age":
+        ctx.user_data["setting"] = "price5m_filter_min_age_sec"
+        cur_min = state["settings"].get("price5m_filter_min_age_sec", 3600) // 60
+        await q.edit_message_text(
+            f"📉 *5m Price Filter Age Threshold*\n\n"
+            f"Current: *{cur_min} minutes*\n\n"
+            f"Tokens *older* than this must have a positive 5m price change to be bought.\n"
+            f"Tokens *younger* than this are not filtered by 5m price (they may dip early and still pump).\n\n"
+            f"Default: 60 min — anything older than 1 hour must be trending up in the last 5 min.\n"
+            f"Set to *0* to apply the filter to ALL tokens regardless of age.\n\n"
+            f"Send a value in *minutes*:",
+            parse_mode="Markdown", reply_markup=kb_back())
+        return WAITING_SET_PRICE5M_FILTER_AGE
+
     elif data == "set_priority_fee":
         ctx.user_data["setting"] = "priority_fee"
         cur = state["settings"].get("priority_fee", 20000)
@@ -1920,6 +2197,51 @@ async def _button_handler_inner(update, ctx, q, data):
         ctx.user_data["setting"] = "min_token_age_sec"
         await q.edit_message_text(f"⏱ *Min Token Age*\nCurrent: {state['settings'].get('min_token_age_sec',120)}s\n\nSend value in seconds:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MIN_AGE
+
+    elif data == "set_max_token_age":
+        ctx.user_data["setting"] = "max_token_age_sec"
+        cur = state["settings"].get("max_token_age_sec", 0)
+        cur_lbl = "OFF" if cur == 0 else f"{cur//60} min"
+        await q.edit_message_text(
+            f"🔝 *Max Token Age*\n\n"
+            f"Current: *{cur_lbl}*\n\n"
+            f"Rejects tokens *older* than this threshold — keeps the bot focused on fresh, momentum-driven coins.\n\n"
+            f"Examples:\n"
+            f"• `60` = max 1 hour old (aggressive, very fresh only)\n"
+            f"• `120` = max 2 hours (recommended)\n"
+            f"• `240` = max 4 hours\n"
+            f"• `0` = disabled (no upper age limit)\n\n"
+            f"Send a value in *minutes* (or `0` to disable):",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_TOKEN_AGE
+
+    elif data == "set_price1h_filter_age":
+        ctx.user_data["setting"] = "price1h_filter_min_age_sec"
+        cur_min = state["settings"].get("price1h_filter_min_age_sec", 1800) // 60
+        await q.edit_message_text(
+            f"📉 *1h Dump Guard — Min Age to Apply*\n\n"
+            f"Current: *{cur_min} minutes*\n\n"
+            f"Only tokens *older* than this get the 1h trend check.\n"
+            f"Very new tokens don't have enough 1h history to judge, so they're exempt.\n\n"
+            f"Default: 30 min. Send a value in *minutes*:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRICE1H_FILTER_AGE
+
+    elif data == "set_price1h_old_pct":
+        ctx.user_data["setting"] = "price1h_old_min_pct"
+        cur = state["settings"].get("price1h_old_min_pct", -10.0)
+        await q.edit_message_text(
+            f"📉 *1h Dump Guard — Min 1h % Change*\n\n"
+            f"Current: *{cur:+.1f}%*\n\n"
+            f"Tokens with a 1h price change *below* this are rejected.\n"
+            f"This blocks buying into active downtrends.\n\n"
+            f"Looking at your screenshots: CHIBI was -22.1% and HOWSE was +30% in 1h.\n"
+            f"A setting of `-10` would have blocked CHIBI but allowed HOWSE.\n\n"
+            f"Examples:\n"
+            f"• `-5` = strict (rejects any token down more than 5% over 1h)\n"
+            f"• `-10` = balanced (recommended)\n"
+            f"• `-20` = lenient\n"
+            f"• `-50` = almost off (only blocks violent dumps)\n\n"
+            f"Send a value (negative number):",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRICE1H_OLD_PCT
 
     elif data == "set_vol5m":
         ctx.user_data["setting"] = "min_vol5m_pct"
@@ -2102,13 +2424,29 @@ async def _button_handler_inner(update, ctx, q, data):
     elif data == "health":
         a  = state["api_stats"]
         pt = a["price_ok"]+a["price_fail"]; qt = a["quote_ok"]+a["quote_fail"]; st = a["swap_ok"]+a["swap_fail"]
+        price_pct = a["price_ok"] / max(pt, 1)
+        price_health_icon = "✅" if price_pct >= 0.95 else ("⚠️" if price_pct >= 0.80 else "🔴")
         err_txt = "\n".join([
             f"  [{escape_md(e['time'])}] {escape_md(e['context'])}: {escape_md(e['error'])}"
             for e in state["errors"][-3:]]) or "  None ✅"
+        # Circuit breaker status
+        now_t = time.time()
+        circuit_lines = []
+        src_labels = {"jup_v2": "Jupiter v2", "dexscreen": "DexScreener", "jup_quote": "Jup Quote", "gecko": "Gecko"}
+        for src_key, label in src_labels.items():
+            backoff_until, fails = _src_circuit[src_key]
+            if now_t < backoff_until:
+                remaining = int(backoff_until - now_t)
+                circuit_lines.append(f"  🔴 {label}: cooling down {remaining}s (fails: {fails})")
+            else:
+                circuit_lines.append(f"  ✅ {label}: open")
+        circuit_txt = "\n".join(circuit_lines)
         s = state["settings"]
         await q.edit_message_text(
-            f"🏥 *Health*\n\n*API Rates:*\n"
-            f"├ Price: {a['price_ok']}/{pt} ({a['price_ok']/max(pt,1):.0%})\n"
+            f"🏥 *Health*\n\n"
+            f"*{price_health_icon} Price Health: {price_pct:.0%}* ({a['price_ok']}/{pt})\n\n"
+            f"*API Sources:*\n{circuit_txt}\n\n"
+            f"*API Rates:*\n"
             f"├ Quote: {a['quote_ok']}/{qt} ({a['quote_ok']/max(qt,1):.0%})\n"
             f"├ Swap:  {a['swap_ok']}/{st} ({a['swap_ok']/max(st,1):.0%})\n"
             f"├ Confirm: {a['confirm_ok']} ok | {a['confirm_timeout']} timeout\n"
@@ -2156,6 +2494,36 @@ async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = ctx.user_data.get("setting"); txt = update.message.text.strip()
     try:
         val = float(txt)
+        # price5m_filter_min_age_sec: user inputs minutes, store as seconds
+        if key == "price5m_filter_min_age_sec":
+            state["settings"][key] = int(val * 60)
+            young_pct = state["settings"].get("price5m_young_min_pct", -5.0)
+            old_pct   = state["settings"].get("price5m_old_min_pct", 1.0)
+            await update.message.reply_text(
+                f"✅ *5m Filter Age Split* updated to `{int(val)} min`\n\n"
+                f"• Young (<{int(val)}min): 5m ≥ {young_pct:+.1f}%\n"
+                f"• Old (>{int(val)}min): 5m ≥ {old_pct:+.1f}%",
+                parse_mode="Markdown", reply_markup=kb_main())
+            return ConversationHandler.END
+        # max_token_age_sec: user inputs minutes, store as seconds (0 = disabled)
+        if key == "max_token_age_sec":
+            state["settings"][key] = int(val * 60)
+            lbl = "OFF (no upper limit)" if val == 0 else f"{int(val)} minutes"
+            await update.message.reply_text(
+                f"✅ *Max Token Age* updated to `{lbl}`",
+                parse_mode="Markdown", reply_markup=kb_main())
+            await db_save_settings()
+            return ConversationHandler.END
+        # price1h_filter_min_age_sec: user inputs minutes, store as seconds
+        if key == "price1h_filter_min_age_sec":
+            state["settings"][key] = int(val * 60)
+            old_pct = state["settings"].get("price1h_old_min_pct", -10.0)
+            await update.message.reply_text(
+                f"✅ *1h Dump Guard Age* updated to `{int(val)} min`\n\n"
+                f"Tokens older than {int(val)}min with 1h < {old_pct:+.1f}% will be rejected.",
+                parse_mode="Markdown", reply_markup=kb_main())
+            await db_save_settings()
+            return ConversationHandler.END
         int_keys = ("slippage_bps","entry_slippage_bps","exit_slippage_bps",
                     "max_demo_positions","max_real_positions","min_token_age_sec",
                     "max_hold_minutes","multi_signal_exit_count","stagnation_secs",
@@ -2299,6 +2667,7 @@ async def _handle_snipe(app, mint, pair, info):
         f"├ Liquidity:  ${info['liquidity']:,.0f}\n"
         f"├ Vol5m:      ${info.get('vol5m',0):,.0f} ({info.get('vol5m_pct',0):.1f}%)\n"
         f"├ Age:        {age_min:.1f} min\n"
+        f"├ Price 5m:   {info.get('price_5m',0):+.1f}%\n"
         f"├ ML Score:   {info['ml_score']:.0%}\n"
         f"├ RugCheck:   {info['rc_score']}\n└ Risks:      {risks}\n"
     )
@@ -2379,6 +2748,12 @@ def main():
             WAITING_SET_PRE_TP_TRAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRE_TP_TRAIL_ACT:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRIORITY_FEE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRICE5M_FILTER_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRICE5M_YOUNG_PCT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRICE5M_OLD_PCT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MAX_TOKEN_AGE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRICE1H_FILTER_AGE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRICE1H_OLD_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
