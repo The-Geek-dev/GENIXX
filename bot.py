@@ -112,6 +112,8 @@ WAITING_SET_PRICE5M_OLD_PCT     = 51  # 5m min % for old tokens
 WAITING_SET_MAX_TOKEN_AGE        = 52  # max token age in minutes
 WAITING_SET_PRICE1H_FILTER_AGE  = 53  # 1h price filter age threshold (minutes)
 WAITING_SET_PRICE1H_OLD_PCT      = 54  # 1h min % for old tokens
+WAITING_SET_PRICE1H_MAX_PCT      = 55  # max 1h pump % before rejecting (already-pumped guard)
+WAITING_SET_PUMP_EXHAUSTION      = 56  # exhaustion ratio: 5m must be >= this fraction of 1h
 
 def validate_config():
     missing = [k for k, v in {
@@ -183,6 +185,8 @@ state = {
         "price5m_old_min_pct":   1.0,    # min 5m % for tokens OLDER than age threshold (must be actively rising)
         "price1h_filter_min_age_sec": 1800,  # apply 1h trend filter only to tokens older than this (seconds)
         "price1h_old_min_pct":  -10.0,   # reject old tokens with 1h change below this (e.g. -10% = strong dump guard)
+        "price1h_max_pct":      500.0,   # reject tokens already up MORE than this % in 1h (0 = disabled) — blocks exhausted pumps
+        "pump_exhaustion_ratio": 0.05,   # reject if 5m% < this fraction of 1h% — catches stalling pumps (0 = disabled)
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
@@ -951,6 +955,8 @@ def kb_settings():
          InlineKeyboardButton(f"🔵 Old(>split) 5m≥: {s.get('price5m_old_min_pct',1.0):+.1f}%", callback_data="set_price5m_old_pct")],
         [InlineKeyboardButton(f"📉 1h Dump Guard Age: {s.get('price1h_filter_min_age_sec',1800)//60}min", callback_data="set_price1h_filter_age"),
          InlineKeyboardButton(f"📉 1h Min%: {s.get('price1h_old_min_pct',-10.0):+.1f}%", callback_data="set_price1h_old_pct")],
+        [InlineKeyboardButton(f"🚀 Max 1h Pump: {'OFF' if not s.get('price1h_max_pct',500) else str(int(s.get('price1h_max_pct',500)))+'%'}", callback_data="set_price1h_max_pct"),
+         InlineKeyboardButton(f"😮 Exhaustion Ratio: {s.get('pump_exhaustion_ratio',0.05)}", callback_data="set_pump_exhaustion")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
         [InlineKeyboardButton(hm,  callback_data="toggle_house_money"),
@@ -1416,9 +1422,27 @@ async def evaluate_new_token(pair):
     else:
         price1h_fails = False
 
+    # ── Already-pumped guard — reject tokens that have run too far ────────────
+    # A token up 1499% in 1h with only +6.2% in 5m (like DOGEFATHER) is near
+    # exhaustion. The 5m filter alone won't catch it because momentum has already
+    # slowed at the top. This cap blocks buying into a completed move.
+    price1h_max_pct = s.get("price1h_max_pct", 500.0)
+    already_pumped  = (price1h_max_pct > 0 and price_1h > price1h_max_pct)
+
+    # ── Pump exhaustion ratio — 5m momentum relative to 1h move ──────────────
+    # ratio = price_5m / price_1h. If the 1h move is large but 5m has gone flat,
+    # the pump is stalling. Only applied when price_1h > 50% to avoid noise.
+    # DOGEFATHER: 6.2 / 1499 = 0.004 — far below 0.05 threshold.
+    exhaustion_ratio = s.get("pump_exhaustion_ratio", 0.05)
+    exhaustion_fails = False
+    if exhaustion_ratio > 0 and price_1h > 50:
+        ratio = price_5m / price_1h
+        exhaustion_fails = (ratio < exhaustion_ratio)
+
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
               and not rc_too_risky and age_sec >= min_age_sec and vol5m_pct >= min_vol5m_pct
-              and not price5m_fails and not age_too_old and not price1h_fails)
+              and not price5m_fails and not age_too_old and not price1h_fails
+              and not already_pumped and not exhaustion_fails)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1433,6 +1457,11 @@ async def evaluate_new_token(pair):
             reasons.append(f"price5m={price_5m:.1f}%<{price5m_min_pct:.1f}% required [{bracket}]")
         if price1h_fails:
             reasons.append(f"price1h={price_1h:.1f}%<{price1h_old_min_pct:.1f}% (1h dump guard)")
+        if already_pumped:
+            reasons.append(f"price1h={price_1h:.0f}%>{price1h_max_pct:.0f}% (already pumped — exhausted)")
+        if exhaustion_fails:
+            ratio = price_5m / price_1h if price_1h > 0 else 0
+            reasons.append(f"exhaustion ratio={ratio:.3f}<{exhaustion_ratio} (pump stalling: 1h={price_1h:.0f}% but 5m={price_5m:.1f}%)")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
             "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
@@ -2243,6 +2272,41 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Send a value (negative number):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRICE1H_OLD_PCT
 
+    elif data == "set_price1h_max_pct":
+        ctx.user_data["setting"] = "price1h_max_pct"
+        cur = state["settings"].get("price1h_max_pct", 500.0)
+        await q.edit_message_text(
+            f"🚀 *Max 1h Pump Cap*\n\n"
+            f"Current: *{'OFF' if cur == 0 else f'{cur:.0f}%'}*\n\n"
+            f"Rejects tokens that have *already pumped* more than this % in the last hour.\n"
+            f"Protects against buying into an exhausted move near the top.\n\n"
+            f"*Real example:* DOGEFATHER was +1499% in 1h with only +6.2% in 5m.\n"
+            f"This filter would have blocked it instantly.\n\n"
+            f"• `200` = only tokens up less than 2x in 1h (strict)\n"
+            f"• `500` = up to 5x allowed (recommended)\n"
+            f"• `1000` = up to 10x allowed (lenient)\n"
+            f"• `0` = disabled\n\n"
+            f"Send a value (e.g. `500`):",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRICE1H_MAX_PCT
+
+    elif data == "set_pump_exhaustion":
+        ctx.user_data["setting"] = "pump_exhaustion_ratio"
+        cur = state["settings"].get("pump_exhaustion_ratio", 0.05)
+        await q.edit_message_text(
+            f"😮 *Pump Exhaustion Ratio*\n\n"
+            f"Current: *{cur}*\n\n"
+            f"Catches pumps that are *stalling* — large 1h move but tiny 5m momentum.\n"
+            f"Formula: `5m% ÷ 1h%` must be ≥ this threshold.\n\n"
+            f"*Real example:* DOGEFATHER → 6.2 ÷ 1499 = 0.004\n"
+            f"At threshold 0.05 it would have been *rejected*.\n\n"
+            f"A healthy fresh pump might be: +80% 1h, +8% 5m → ratio 0.10 ✅\n\n"
+            f"• `0.02` = lenient (catches only extreme stalls)\n"
+            f"• `0.05` = balanced (recommended)\n"
+            f"• `0.10` = strict (requires strong ongoing momentum)\n"
+            f"• `0` = disabled\n\n"
+            f"Send a decimal value (e.g. `0.05`):",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PUMP_EXHAUSTION
+
     elif data == "set_vol5m":
         ctx.user_data["setting"] = "min_vol5m_pct"
         await q.edit_message_text(f"📊 *Min 5m Volume %*\nCurrent: {state['settings'].get('min_vol5m_pct',10)}%\n\nSend new value:",
@@ -2754,6 +2818,8 @@ def main():
             WAITING_SET_MAX_TOKEN_AGE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRICE1H_FILTER_AGE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRICE1H_OLD_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRICE1H_MAX_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PUMP_EXHAUSTION:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
