@@ -114,6 +114,7 @@ WAITING_SET_PRICE1H_FILTER_AGE  = 53  # 1h price filter age threshold (minutes)
 WAITING_SET_PRICE1H_OLD_PCT      = 54  # 1h min % for old tokens
 WAITING_SET_PRICE1H_MAX_PCT      = 55  # max 1h pump % before rejecting (already-pumped guard)
 WAITING_SET_PUMP_EXHAUSTION      = 56  # exhaustion ratio: 5m must be >= this fraction of 1h
+WAITING_SET_MAX_MOMENTUM_PRODUCT = 57  # 5m% × 1h% combined cap — blocks late FOMO entries
 
 def validate_config():
     missing = [k for k, v in {
@@ -178,15 +179,16 @@ state = {
         "min_score": 0.5,
         "min_rugcheck": 500,
         "min_token_age_sec": 120,
-        "max_token_age_sec": 14400,   # 240 min — reject tokens older than this (0 = disabled)
+        "max_token_age_sec": 7200,   # 120 min default — reject tokens older than this (0 = disabled)
         "min_vol5m_pct": 10.0,
         "price5m_filter_min_age_sec": 3600,  # apply 5m price filter only to tokens older than this (seconds)
         "price5m_young_min_pct": -5.0,    # min 5m % for tokens YOUNGER than age threshold (relaxed, allows small dips)
         "price5m_old_min_pct":   1.0,    # min 5m % for tokens OLDER than age threshold (must be actively rising)
         "price1h_filter_min_age_sec": 1800,  # apply 1h trend filter only to tokens older than this (seconds)
-        "price1h_old_min_pct":  -10.0,   # reject old tokens with 1h change below this (e.g. -10% = strong dump guard)
+        "price1h_old_min_pct":   0.0,    # reject tokens with 1h < this — 0% blocks all downtrending tokens incl Boss (-1.4%)
         "price1h_max_pct":      500.0,   # reject tokens already up MORE than this % in 1h (0 = disabled) — blocks exhausted pumps
         "pump_exhaustion_ratio": 0.05,   # reject if 5m% < this fraction of 1h% — catches stalling pumps (0 = disabled)
+        "max_momentum_product": 10000.0, # 5m% × 1h% cap — blocks late FOMO: CHIBIWHALE=61770 ❌ WOMI=9226 ✅ (0=disabled)
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
@@ -957,6 +959,7 @@ def kb_settings():
          InlineKeyboardButton(f"📉 1h Min%: {s.get('price1h_old_min_pct',-10.0):+.1f}%", callback_data="set_price1h_old_pct")],
         [InlineKeyboardButton(f"🚀 Max 1h Pump: {'OFF' if not s.get('price1h_max_pct',500) else str(int(s.get('price1h_max_pct',500)))+'%'}", callback_data="set_price1h_max_pct"),
          InlineKeyboardButton(f"😮 Exhaustion Ratio: {s.get('pump_exhaustion_ratio',0.05)}", callback_data="set_pump_exhaustion")],
+        [InlineKeyboardButton(f"🔥 Max Momentum: {'OFF' if not s.get('max_momentum_product',10000) else str(int(s.get('max_momentum_product',10000)))}", callback_data="set_max_momentum_product")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
         [InlineKeyboardButton(hm,  callback_data="toggle_house_money"),
@@ -1423,26 +1426,29 @@ async def evaluate_new_token(pair):
         price1h_fails = False
 
     # ── Already-pumped guard — reject tokens that have run too far ────────────
-    # A token up 1499% in 1h with only +6.2% in 5m (like DOGEFATHER) is near
-    # exhaustion. The 5m filter alone won't catch it because momentum has already
-    # slowed at the top. This cap blocks buying into a completed move.
     price1h_max_pct = s.get("price1h_max_pct", 500.0)
     already_pumped  = (price1h_max_pct > 0 and price_1h > price1h_max_pct)
 
     # ── Pump exhaustion ratio — 5m momentum relative to 1h move ──────────────
-    # ratio = price_5m / price_1h. If the 1h move is large but 5m has gone flat,
-    # the pump is stalling. Only applied when price_1h > 50% to avoid noise.
-    # DOGEFATHER: 6.2 / 1499 = 0.004 — far below 0.05 threshold.
     exhaustion_ratio = s.get("pump_exhaustion_ratio", 0.05)
     exhaustion_fails = False
     if exhaustion_ratio > 0 and price_1h > 50:
         ratio = price_5m / price_1h
         exhaustion_fails = (ratio < exhaustion_ratio)
 
+    # ── Combined momentum cap — blocks late FOMO entries ─────────────────────
+    # When BOTH 5m and 1h are large simultaneously it signals final-push exhaustion.
+    # CHIBIWHALE: 142×435=61,770 ❌  ALLORNOT: 66×282=18,698 ❌
+    # WOMI: 36×257=9,226 ✅          PISS: 5.8×21.9=127 ✅
+    # Only computed when both are positive to avoid false triggers.
+    momentum_product     = price_5m * price_1h if price_5m > 0 and price_1h > 0 else 0
+    max_momentum_product = s.get("max_momentum_product", 10000.0)
+    momentum_overheated  = (max_momentum_product > 0 and momentum_product > max_momentum_product)
+
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
               and not rc_too_risky and age_sec >= min_age_sec and vol5m_pct >= min_vol5m_pct
               and not price5m_fails and not age_too_old and not price1h_fails
-              and not already_pumped and not exhaustion_fails)
+              and not already_pumped and not exhaustion_fails and not momentum_overheated)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1462,6 +1468,8 @@ async def evaluate_new_token(pair):
         if exhaustion_fails:
             ratio = price_5m / price_1h if price_1h > 0 else 0
             reasons.append(f"exhaustion ratio={ratio:.3f}<{exhaustion_ratio} (pump stalling: 1h={price_1h:.0f}% but 5m={price_5m:.1f}%)")
+        if momentum_overheated:
+            reasons.append(f"momentum product={momentum_product:.0f}>{max_momentum_product:.0f} (overheated: 5m={price_5m:.1f}%×1h={price_1h:.1f}%)")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
             "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
@@ -2307,6 +2315,27 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Send a decimal value (e.g. `0.05`):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PUMP_EXHAUSTION
 
+    elif data == "set_max_momentum_product":
+        ctx.user_data["setting"] = "max_momentum_product"
+        cur = state["settings"].get("max_momentum_product", 10000.0)
+        await q.edit_message_text(
+            f"🔥 *Combined Momentum Cap*\n\n"
+            f"Current: *{'OFF' if cur == 0 else str(int(cur))}*\n\n"
+            f"Blocks entries where *both* 5m and 1h momentum are large simultaneously.\n"
+            f"Formula: `5m% × 1h%` must be below this threshold.\n\n"
+            f"*Real trade examples:*\n"
+            f"• CHIBIWHALE: 142 × 435 = 61,770 ❌ (lost -$26)\n"
+            f"• ALLORNOT: 66 × 282 = 18,698 ❌ (lost -$24)\n"
+            f"• EVERYTHING: 25 × 519 = 12,975 ❌ (lost -$30)\n"
+            f"• WOMI: 36 × 257 = 9,226 ✅ (won +$17)\n"
+            f"• PISS: 5.8 × 21.9 = 127 ✅ (won +$12)\n\n"
+            f"• `10000` = recommended (blocks overheated pumps)\n"
+            f"• `15000` = more lenient\n"
+            f"• `5000` = strict\n"
+            f"• `0` = disabled\n\n"
+            f"Send a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_MOMENTUM_PRODUCT
+
     elif data == "set_vol5m":
         ctx.user_data["setting"] = "min_vol5m_pct"
         await q.edit_message_text(f"📊 *Min 5m Volume %*\nCurrent: {state['settings'].get('min_vol5m_pct',10)}%\n\nSend new value:",
@@ -2820,6 +2849,7 @@ def main():
             WAITING_SET_PRICE1H_OLD_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRICE1H_MAX_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PUMP_EXHAUSTION:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_MAX_MOMENTUM_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
