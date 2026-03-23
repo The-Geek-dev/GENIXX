@@ -115,6 +115,7 @@ WAITING_SET_PRICE1H_OLD_PCT      = 54  # 1h min % for old tokens
 WAITING_SET_PRICE1H_MAX_PCT      = 55  # max 1h pump % before rejecting (already-pumped guard)
 WAITING_SET_PUMP_EXHAUSTION      = 56  # exhaustion ratio: 5m must be >= this fraction of 1h
 WAITING_SET_MAX_MOMENTUM_PRODUCT = 57  # 5m% × 1h% combined cap — blocks late FOMO entries
+WAITING_SET_ENTRY_BS_RATIO       = 58  # min buy/sell transaction ratio at entry
 
 def validate_config():
     missing = [k for k, v in {
@@ -189,6 +190,7 @@ state = {
         "price1h_max_pct":      500.0,   # reject tokens already up MORE than this % in 1h (0 = disabled) — blocks exhausted pumps
         "pump_exhaustion_ratio": 0.05,   # reject if 5m% < this fraction of 1h% — catches stalling pumps (0 = disabled)
         "max_momentum_product": 10000.0, # 5m% × 1h% cap — blocks late FOMO: CHIBIWHALE=61770 ❌ WOMI=9226 ✅ (0=disabled)
+        "min_entry_bs_ratio": 1.2,       # min buys/sells ratio in 5m window at entry — blocks distribution (0=disabled)
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
@@ -540,7 +542,9 @@ _price_cache: dict = {}
 _PRICE_CACHE_TTL      = 12.0   # extended: reduces re-fetch frequency for active positions
 _PRICE_CACHE_FAIL_TTL = 5.0    # wait longer before retrying a failed mint
 _rugcheck_cache: dict = {}
-_RUGCHECK_CACHE_TTL   = 300
+_RUGCHECK_CACHE_TTL   = 1800   # 30 min — was 5 min, extended to survive rate limit bursts
+_rugcheck_rate_limited_until = 0.0   # circuit breaker: back off entire RugCheck API when 429d
+_rugcheck_queue_lock = None    # asyncio.Lock — prevents concurrent stampede on startup
 
 # ── Per-source circuit breakers ───────────────────────────────────────────────
 # Each entry: (backoff_until_timestamp, consecutive_failures)
@@ -760,24 +764,59 @@ async def get_token_data(mint):
         log_error("get_token_data", e); return None
 
 async def check_token_safety(mint):
+    global _rugcheck_rate_limited_until, _rugcheck_queue_lock
+    # Lazy-init the lock (must be created inside async context)
+    if _rugcheck_queue_lock is None:
+        _rugcheck_queue_lock = asyncio.Lock()
+
     now = time.time()
+
+    # Cache hit — return immediately without any API call
     if mint in _rugcheck_cache:
         ts, result = _rugcheck_cache[mint]
         if now - ts < _RUGCHECK_CACHE_TTL: return result
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as s:
-            async with s.get(RUGCHECK_API.format(mint)) as r:
-                if r.status == 429:
-                    log.warning("RugCheck rate limited — using safe default")
-                    return {"score": 0, "risks": [], "rugged": False}
-                if r.status == 200:
-                    d = await r.json()
-                    result = {"score": d.get("score",0), "risks": d.get("risks",[]), "rugged": d.get("rugged",False)}
-                    _rugcheck_cache[mint] = (now, result); return result
-    except asyncio.TimeoutError: log.warning(f"RugCheck timeout {mint[:8]}")
-    except Exception as e: log.warning(f"RugCheck error {mint[:8]}: {e}")
-    safe = {"score": 0, "risks": [], "rugged": False}
-    _rugcheck_cache[mint] = (now, safe); return safe
+
+    # Circuit breaker — RugCheck is rate limited, skip and use safe default
+    if now < _rugcheck_rate_limited_until:
+        remaining = int(_rugcheck_rate_limited_until - now)
+        log.debug(f"RugCheck circuit open ({remaining}s remaining) — using safe default for {mint[:8]}")
+        safe = {"score": 0, "risks": [], "rugged": False}
+        _rugcheck_cache[mint] = (now, safe)
+        return safe
+
+    # Serialise concurrent calls — prevents burst of 20+ simultaneous requests on startup
+    async with _rugcheck_queue_lock:
+        # Re-check cache after acquiring lock (another coroutine may have fetched it)
+        now = time.time()
+        if mint in _rugcheck_cache:
+            ts, result = _rugcheck_cache[mint]
+            if now - ts < _RUGCHECK_CACHE_TTL: return result
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as s:
+                async with s.get(RUGCHECK_API.format(mint)) as r:
+                    if r.status == 429:
+                        # Open circuit for 60 seconds on rate limit
+                        _rugcheck_rate_limited_until = time.time() + 60
+                        log.warning(f"RugCheck rate limited — circuit open 60s, safe default for {mint[:8]}")
+                        safe = {"score": 0, "risks": [], "rugged": False}
+                        _rugcheck_cache[mint] = (now, safe)
+                        return safe
+                    if r.status == 200:
+                        d = await r.json()
+                        result = {"score": d.get("score",0), "risks": d.get("risks",[]), "rugged": d.get("rugged",False)}
+                        _rugcheck_cache[mint] = (now, result)
+                        # Small delay after successful call to avoid burst requests
+                        await asyncio.sleep(0.2)
+                        return result
+        except asyncio.TimeoutError:
+            log.warning(f"RugCheck timeout {mint[:8]}")
+        except Exception as e:
+            log.warning(f"RugCheck error {mint[:8]}: {e}")
+
+        safe = {"score": 0, "risks": [], "rugged": False}
+        _rugcheck_cache[mint] = (now, safe)
+        return safe
 
 # ============================================================
 # WALLET BALANCE
@@ -960,6 +999,7 @@ def kb_settings():
         [InlineKeyboardButton(f"🚀 Max 1h Pump: {'OFF' if not s.get('price1h_max_pct',500) else str(int(s.get('price1h_max_pct',500)))+'%'}", callback_data="set_price1h_max_pct"),
          InlineKeyboardButton(f"😮 Exhaustion Ratio: {s.get('pump_exhaustion_ratio',0.05)}", callback_data="set_pump_exhaustion")],
         [InlineKeyboardButton(f"🔥 Max Momentum: {'OFF' if not s.get('max_momentum_product',10000) else str(int(s.get('max_momentum_product',10000)))}", callback_data="set_max_momentum_product")],
+        [InlineKeyboardButton(f"📊 Entry B/S Ratio: {s.get('min_entry_bs_ratio',1.2)}", callback_data="set_entry_bs_ratio")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
         [InlineKeyboardButton(hm,  callback_data="toggle_house_money"),
@@ -1445,10 +1485,20 @@ async def evaluate_new_token(pair):
     max_momentum_product = s.get("max_momentum_product", 10000.0)
     momentum_overheated  = (max_momentum_product > 0 and momentum_product > max_momentum_product)
 
+    # ── Entry buy/sell ratio — blocks distribution phase entries ─────────────
+    # Tokens with more sell txns than buy txns in 5m despite rising price are
+    # being distributed — whales selling into retail FOMO.
+    b5m_txns = float(pair.get("txns",{}).get("m5",{}).get("buys",0) or 0)
+    s5m_txns = float(pair.get("txns",{}).get("m5",{}).get("sells",0) or 0)
+    min_entry_bs_ratio = s.get("min_entry_bs_ratio", 1.2)
+    entry_bs_ratio     = b5m_txns / (s5m_txns + 1)
+    entry_bs_fails     = (min_entry_bs_ratio > 0 and s5m_txns > 0 and entry_bs_ratio < min_entry_bs_ratio)
+
     passes = (liq >= min_liq and ml_score >= min_score and not rugged
               and not rc_too_risky and age_sec >= min_age_sec and vol5m_pct >= min_vol5m_pct
               and not price5m_fails and not age_too_old and not price1h_fails
-              and not already_pumped and not exhaustion_fails and not momentum_overheated)
+              and not already_pumped and not exhaustion_fails and not momentum_overheated
+              and not entry_bs_fails)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1470,6 +1520,8 @@ async def evaluate_new_token(pair):
             reasons.append(f"exhaustion ratio={ratio:.3f}<{exhaustion_ratio} (pump stalling: 1h={price_1h:.0f}% but 5m={price_5m:.1f}%)")
         if momentum_overheated:
             reasons.append(f"momentum product={momentum_product:.0f}>{max_momentum_product:.0f} (overheated: 5m={price_5m:.1f}%×1h={price_1h:.1f}%)")
+        if entry_bs_fails:
+            reasons.append(f"entry B/S={entry_bs_ratio:.2f}<{min_entry_bs_ratio} (distribution: {b5m_txns:.0f}B/{s5m_txns:.0f}S)")
         log.info(f"evaluate: {symbol} REJECTED — {', '.join(reasons)}")
     return {"mint": mint, "symbol": symbol, "liquidity": liq, "volume": vol24,
             "vol5m": vol5m, "vol5m_pct": vol5m_pct, "age_sec": age_sec,
@@ -2336,6 +2388,23 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Send a value:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_MAX_MOMENTUM_PRODUCT
 
+    elif data == "set_entry_bs_ratio":
+        ctx.user_data["setting"] = "min_entry_bs_ratio"
+        cur = state["settings"].get("min_entry_bs_ratio", 1.2)
+        await q.edit_message_text(
+            f"📊 *Entry Buy/Sell Ratio*\n\n"
+            f"Current: *{cur}*\n\n"
+            f"Requires more buy transactions than sell transactions in the 5m window.\n"
+            f"Tokens with sell-heavy flow despite rising price are in distribution —\n"
+            f"whales dumping into retail buyers.\n\n"
+            f"Formula: `5m buys ÷ 5m sells` must be ≥ this value.\n\n"
+            f"• `1.0` = buys must at least equal sells\n"
+            f"• `1.2` = buys must be 20% more than sells (recommended)\n"
+            f"• `1.5` = strict — strong buyer dominance required\n"
+            f"• `0` = disabled\n\n"
+            f"Send a decimal value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_ENTRY_BS_RATIO
+
     elif data == "set_vol5m":
         ctx.user_data["setting"] = "min_vol5m_pct"
         await q.edit_message_text(f"📊 *Min 5m Volume %*\nCurrent: {state['settings'].get('min_vol5m_pct',10)}%\n\nSend new value:",
@@ -2727,8 +2796,15 @@ async def raydium_ws_sniper(app):
     backoff = 2
     while True:
         try:
-            async with websockets.connect(wss_url, ping_interval=20, ping_timeout=30) as ws:
+            async with websockets.connect(
+                wss_url,
+                ping_interval=15,       # send keepalive ping every 15s
+                ping_timeout=20,        # fail if no pong within 20s
+                close_timeout=5,
+                max_size=2**20,         # 1MB max message size
+            ) as ws:
                 backoff = 2
+                log.info("Raydium WS connected")
                 await ws.send(json.dumps({"jsonrpc":"2.0","id":1,"method":"logsSubscribe",
                     "params":[{"mentions":[RAYDIUM_PROGRAM]},{"commitment":"confirmed"}]}))
                 async for raw in ws:
@@ -2736,21 +2812,31 @@ async def raydium_ws_sniper(app):
                         msg  = json.loads(raw)
                         logs = msg.get("params",{}).get("result",{}).get("value",{}).get("logs",[])
                         if not any("initialize" in l.lower() for l in logs): continue
-                        await asyncio.sleep(4)
+                        # Wait for pool to be indexed by DexScreener
+                        await asyncio.sleep(5)
+                        found_mints = []
                         for line in logs:
                             for part in line.split():
-                                if len(part) in (43,44) and part not in state["seen_pairs"]:
-                                    state["seen_pairs"][part] = time.time()
-                                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
-                                        pd = await _fetch_full_pair(sess, part)
-                                        if pd:
-                                            info = await evaluate_new_token(pd)
-                                            if info["passes_rules"]:
-                                                await _handle_snipe(app, part, pd, info)
+                                if len(part) in (43,44) and part not in state["seen_pairs"] and part not in state.get("bought_mints", set()):
+                                    found_mints.append(part)
+                        for part in found_mints:
+                            state["seen_pairs"][part] = time.time()
+                            try:
+                                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
+                                    pd = await _fetch_full_pair(sess, part)
+                                    if pd:
+                                        info = await evaluate_new_token(pd)
+                                        if info["passes_rules"]:
+                                            await _handle_snipe(app, part, pd, info)
+                                # Small delay between evaluations to avoid RugCheck burst
+                                await asyncio.sleep(0.5)
+                            except Exception as e:
+                                log_error("raydium_ws/eval", e)
                     except Exception as e: log_error("raydium_ws/msg", e)
         except Exception as e:
             log_error("raydium_ws/connect", e)
-            await asyncio.sleep(backoff); backoff = min(backoff*2, 60)
+            log.info(f"Raydium WS reconnecting in {backoff}s...")
+            await asyncio.sleep(backoff); backoff = min(backoff*2, 120)
 
 async def _handle_snipe(app, mint, pair, info):
     risks = ", ".join([r.get("name","") for r in info["safety"].get("risks",[])]) or "None"
@@ -2850,6 +2936,7 @@ def main():
             WAITING_SET_PRICE1H_MAX_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PUMP_EXHAUSTION:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_MOMENTUM_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_ENTRY_BS_RATIO:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
