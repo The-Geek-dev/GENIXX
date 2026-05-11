@@ -1597,10 +1597,7 @@ async def raydium_ws_sniper(app):
                 # ── Connected successfully ───────────────────────────────
                 if attempt > 1:
                     state["api_stats"]["ws_reconnects"] += 1
-                    log.info(f"Raydium WS reconnected ✅ (total reconnects: {state['api_stats']['ws_reconnects']})")
-                    await _safe_notify(app,
-                        f"🔌 *Raydium WS reconnected* ✅\n"
-                        f"_(attempt #{attempt} | total reconnects: {state['api_stats']['ws_reconnects']})_")
+                    log.info(f"Raydium WS reconnected (attempt #{attempt} | total: {state['api_stats']['ws_reconnects']})")
                 else:
                     log.info("Raydium WS connected ✅")
 
