@@ -729,10 +729,14 @@ async def get_quote(in_m, out_m, amt, slippage=100):
         async with sess.get(JUPITER_QUOTE_API,
             params={"inputMint":in_m,"outputMint":out_m,"amount":amt,"slippageBps":slippage},
             timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status == 429:
+                await asyncio.sleep(2)   # back off on rate limit
+                raise ValueError("Quote 429")
             if r.status != 200: raise ValueError(f"Quote {r.status}")
             return await r.json()
     try:
-        q = await with_retry(_f, label="quote"); state["api_stats"]["quote_ok"] += 1; return q
+        q = await with_retry(_f, retries=4, delay=2.0, label="quote")
+        state["api_stats"]["quote_ok"] += 1; return q
     except Exception as e:
         state["api_stats"]["quote_fail"] += 1; log_error("get_quote", e); return None
 
