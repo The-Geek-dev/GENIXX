@@ -1209,14 +1209,22 @@ async def _tiered_profit_take(app, mint, pos, current_price, milestone: str, is_
     result = None
     if is_demo:
         sell_fee      = calc_fees(usdc_estimate)["dex_fee"]
-        usdc_received = usdc_estimate - sell_fee
+        usdc_gross    = usdc_estimate
     else:
         result = await execute_sell(mint, tokens_to_sell)
         if not result:
             await _safe_notify(app, f"⚠️ *{pfx}Profit-take FAILED at {milestone} for {pos['symbol']}*")
             return
-        usdc_received = result["usdc_received"]
-        sell_fee      = calc_fees(usdc_received)["dex_fee"]
+        usdc_gross    = result["usdc_received"]
+        sell_fee      = calc_fees(usdc_gross)["dex_fee"]
+    usdc_received = usdc_gross - sell_fee
+    # Attribute this tranche's realized profit against its own cost basis, and
+    # roll the fee into cumulative fees — so the final close (which only sees
+    # whatever tokens remain) doesn't have to re-derive P&L for tokens already sold.
+    cost_per_token = pos.get("cost_per_token", pos["entry_price"])
+    tranche_cost   = tokens_to_sell * cost_per_token
+    pos["realized_pnl"] = pos.get("realized_pnl", 0.0) + (usdc_gross - tranche_cost)
+    pos["fees_paid"]    = pos.get("fees_paid", 0.0) + sell_fee
     pos["token_amount"] = tokens_remaining
     pos[f"pt_{milestone}_done"] = True
     await db_save_position(mint, pos, is_demo)
@@ -1252,14 +1260,20 @@ async def _early_profit_take(app, mint, pos, current_price, mult, is_demo: bool)
 
     if is_demo:
         sell_fee      = calc_fees(usdc_estimate)["dex_fee"]
-        usdc_received = usdc_estimate - sell_fee
+        usdc_gross    = usdc_estimate
     else:
         result = await execute_sell(mint, tokens_to_sell)
         if not result:
             await _safe_notify(app, f"⚠️ *{pfx}Early profit-take FAILED for {pos['symbol']}*")
             return
-        usdc_received = result["usdc_received"]
+        usdc_gross    = result["usdc_received"]
+        sell_fee      = calc_fees(usdc_gross)["dex_fee"]
+    usdc_received = usdc_gross - sell_fee
 
+    cost_per_token = pos.get("cost_per_token", pos["entry_price"])
+    tranche_cost   = tokens_to_sell * cost_per_token
+    pos["realized_pnl"] = pos.get("realized_pnl", 0.0) + (usdc_gross - tranche_cost)
+    pos["fees_paid"]    = pos.get("fees_paid", 0.0) + sell_fee
     pos["token_amount"]   = tokens_remaining
     pos["pt_early_done"]  = True
     # Tighten the trailing stop after the early sell (use 5x-tier level as floor)
@@ -1297,16 +1311,32 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
             sig_link = f"\n🔗 [Solscan](https://solscan.io/tx/{sell_r['signature']})" if sell_r else ""
             proj_txt = ""; tx_sig = sell_r["signature"] if sell_r else None
     else:
-        sell_fee = calc_fees(pos["amount_usd"] * mult)["dex_fee"]
+        # Base the final leg on what's ACTUALLY left, not the original full
+        # position size — earlier partial sells (early/tiered profit-takes)
+        # already banked their own realized P&L into pos["realized_pnl"].
+        # Using the full original amount_usd here (as before) mis-priced any
+        # trade that had already taken partial profits, and could record a
+        # net-losing final leg as an overall loss even when the position was
+        # hugely profitable overall.
+        remaining_tokens = pos.get("token_amount", 0)
+        cost_per_token   = pos.get("cost_per_token", entry)
+        remaining_cost   = remaining_tokens * cost_per_token
+        prior_realized   = pos.get("realized_pnl", 0.0)
+        prior_fees       = pos.get("fees_paid", 0.0)
         if is_demo:
-            net_pnl  = (mult-1)*pos["amount_usd"] - pos["fees_paid"] - sell_fee
-            usdc_bk  = pos["amount_usd"] * mult; sig_link = ""; tx_sig = None
+            gross    = remaining_tokens * price
+            sell_fee = calc_fees(gross)["dex_fee"]
+            final_leg_pnl = gross - remaining_cost
+            net_pnl  = prior_realized + final_leg_pnl - prior_fees - sell_fee
+            usdc_bk  = gross; sig_link = ""; tx_sig = None
             proj     = net_pnl * (state["settings"]["trade_amount"] / state["settings"]["demo_trade_amount"])
             proj_txt = f"💡 Real projection: *${proj:+.2f}*\n"
         else:
-            sell_r   = await execute_sell(mint, pos.get("token_amount", 0))
-            usdc_bk  = sell_r["usdc_received"] if sell_r else pos["amount_usd"]*mult*0.997
-            net_pnl  = usdc_bk - pos["amount_usd"] - pos["fees_paid"]
+            sell_r   = await execute_sell(mint, remaining_tokens)
+            usdc_bk  = sell_r["usdc_received"] if sell_r else remaining_tokens*price*0.997
+            sell_fee = calc_fees(usdc_bk)["dex_fee"]
+            final_leg_pnl = usdc_bk - remaining_cost
+            net_pnl  = prior_realized + final_leg_pnl - prior_fees - sell_fee
             sig_link = f"\n🔗 [Solscan](https://solscan.io/tx/{sell_r['signature']})" if sell_r else ""
             proj_txt = ""; tx_sig = sell_r["signature"] if sell_r else None
     ml_msg = ""
@@ -1335,13 +1365,17 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
     pnl_total = state["demo_total_pnl"] if is_demo else state["total_pnl"]
     lbl       = "Demo" if is_demo else "Real"
     hm_tag    = "\n🏠 _(Capital already recovered — pure profit)_" if hm else ""
+    prior_realized_line = ""
+    if not hm and pos.get("realized_pnl", 0.0) != 0:
+        prior_realized_line = f"├ From earlier profit-takes: ${pos.get('realized_pnl', 0.0):+.2f}\n"
     await _safe_notify(app,
         f"{'✅' if net_pnl>0 else '❌'} {pfx}{reason}\n\n"
         f"*{pos['symbol']}* | {mult:.2f}x\n{'─'*20}\n"
         f"├ Entry:    ${entry:.6f}\n├ Exit:     ${price:.6f}\n"
-        f"├ Invested: ${pos['amount_usd']:.2f}\n├ Back:     ${usdc_bk:.2f}\n"
+        f"├ Invested: ${pos['amount_usd']:.2f}\n├ This leg's proceeds: ${usdc_bk:.2f}\n"
+        f"{prior_realized_line}"
         f"├ Fees:     -${pos['fees_paid']+sell_fee:.4f}\n"
-        f"└ *Net P&L: ${net_pnl:+.2f}*\n\n"
+        f"└ *Net P&L (whole trade): ${net_pnl:+.2f}*\n\n"
         f"{proj_txt}💰 {lbl} P&L: ${pnl_total:+.2f}{sig_link}{ml_msg}{hm_tag}")
 
 # ============================================================
@@ -1730,6 +1764,13 @@ async def monitor_positions(app):
                     if price <= 0: continue
                     pos["current_price"] = price
                     entry = pos["entry_price"]; mult = price / entry
+                    # Cost basis per token, captured once on the position's first tick
+                    # (before any partial sell can reduce token_amount). Used to correctly
+                    # attribute P&L per-tranche instead of applying the final exit mult
+                    # to the full original position size.
+                    if "cost_per_token" not in pos:
+                        pos["cost_per_token"] = (pos["amount_usd"] / pos["token_amount"]) if pos.get("token_amount") else entry
+                    pos.setdefault("realized_pnl", 0.0)
                     tp = state["settings"]["take_profit"]
                     sl = state["settings"]["stop_loss"]
                     s  = state["settings"]
