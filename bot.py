@@ -26,7 +26,7 @@ from telegram.error import TelegramError
 import agent_link as AL
 
 load_dotenv()
-BOT_VERSION = "v2.635"
+BOT_VERSION = "v2.636"
 
 # ============================================================
 # LOGGING
@@ -2261,8 +2261,9 @@ async def export_snapshot():
         ml_samples=len(state["ml_features"]), version=BOT_VERSION,
         settings_changes=state["settings_changes"][-20:], now=now)
     sess = await _get_session()
-    await GITHUB_DATA.put_file(sess, AL.snapshot_path(now), json.dumps(snap, default=str),
-                               f"snapshot: {len(trades)} trades ({BOT_VERSION})")
+    path = AL.snapshot_path(now, trades[0]["id"] if trades else None, trades[-1]["id"] if trades else None)
+    await GITHUB_DATA.put_file(sess, path, json.dumps(snap, default=str),
+                               f"snapshot: {len(trades)} trades ({BOT_VERSION})", create_only=True)
     if trades:
         await db_set_state("export_last_trade_id", trades[-1]["id"])
     log.info(f"Agent snapshot uploaded: {len(trades)} trades")
@@ -2271,6 +2272,15 @@ async def export_snapshot():
 async def export_loop(app):
     if not GITHUB_DATA.enabled:
         log.info("Agent uploads disabled (set GITHUB_TOKEN and GITHUB_DATA_REPO)"); return
+    # v2.636: v2.635 file names collided within a minute and lost a batch during the
+    # history backfill. Re-upload everything once with unique names (the agent de-dupes by id).
+    try:
+        if await db_get_state("export_schema", 1) != 2:
+            await db_set_state("export_last_trade_id", 0)
+            await db_set_state("export_schema", 2)
+            log.info("Agent export: schema 2 — re-uploading full trade history")
+    except Exception as e:
+        log_error("export_loop/schema", e)
     await asyncio.sleep(90)
     while True:
         try:

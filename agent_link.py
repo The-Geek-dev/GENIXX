@@ -196,10 +196,16 @@ class GitHubData:
             data = await r.json()
             return base64.b64decode(data.get("content", "")).decode("utf-8"), data.get("sha")
 
-    async def put_file(self, session: aiohttp.ClientSession, path: str, text: str, message: str):
-        """Create or replace a file."""
+    async def put_file(self, session: aiohttp.ClientSession, path: str, text: str, message: str,
+                       create_only: bool = False):
+        """
+        Create or replace a file. With create_only=True an existing file is never
+        overwritten (no sha is sent, so GitHub rejects the write with HTTP 422).
+        """
         url = f"{self.API}/repos/{self.repo}/contents/{path}"
-        _, sha = await self.get_file(session, path)
+        sha = None
+        if not create_only:
+            _, sha = await self.get_file(session, path)
         body = {"message": message, "content": base64.b64encode(text.encode("utf-8")).decode("ascii")}
         if sha: body["sha"] = sha
         async with session.put(url, headers=self._headers(), json=body,
@@ -209,9 +215,14 @@ class GitHubData:
             return True
 
 
-def snapshot_path(ts: float) -> str:
+def snapshot_path(ts: float, first_id=None, last_id=None) -> str:
+    """
+    Unique per upload: second-level timestamp + trade id range.
+    (v2.635 used HH MM only, so two uploads in the same minute overwrote each other.)
+    """
     t = time.gmtime(ts)
-    return time.strftime("snapshots/%Y/%m/%d/%H%M.json", t)
+    rng = f"-{first_id}-{last_id}" if first_id is not None else "-none"
+    return time.strftime("snapshots/%Y/%m/%d/%H%M%S", t) + rng + ".json"
 
 
 def build_snapshot(*, trades, settings, open_positions, counters, demo_total_pnl,
