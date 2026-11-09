@@ -23,8 +23,10 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                            MessageHandler, ContextTypes, ConversationHandler, filters)
 from telegram.error import TelegramError
+import agent_link as AL
 
 load_dotenv()
+BOT_VERSION = "v2.635"
 
 # ============================================================
 # LOGGING
@@ -63,6 +65,10 @@ DEXSCREENER_API   = "https://api.dexscreener.com/latest/dex/tokens/"
 RUGCHECK_API      = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
 RUGCHECK_SCORE_MIN = int(os.getenv("RUGCHECK_SCORE_MIN", "500"))
 HELIUS_RPC        = os.getenv("HELIUS_RPC", "")
+# Monitoring agent data exchange (PRIVATE repo, fine-grained token with Contents read/write)
+GITHUB_DATA = AL.GitHubData(os.getenv("GITHUB_TOKEN", ""), os.getenv("GITHUB_DATA_REPO", ""))
+EXPORT_EVERY_SEC     = 30 * 60   # trade snapshot upload interval
+SUGGESTION_POLL_SEC  = 5 * 60    # how often to look for new agent suggestions
 # The Raydium WS sniper subscribes to ALL logs mentioning the Raydium AMM
 # program (one of the highest-throughput programs on Solana), then filters
 # client-side for pool-init events. Helius bills per delivered message, so
@@ -259,6 +265,12 @@ state = {
         "stagnation_secs": 60,    # observation window in seconds
         # Wallet concentration filter
         "max_wallet_concentration": 40.0,
+        # ── Monitoring agent ─────────────────────────────────────────────
+        # "auto"    = apply agent suggestions automatically (DEMO ONLY, within
+        #             agent_link.AGENT_BOUNDS); in real mode it falls back to "suggest"
+        # "suggest" = send each suggestion with Approve / Reject buttons
+        # "off"     = ignore suggestions (watchdog alerts + uploads still run)
+        "agent_mode": "auto",
     },
     "ml_features": [], "ml_labels": [],
     "daily_pnl": 0.0,
@@ -266,6 +278,17 @@ state = {
     "sniper_paused_until": 0.0,
     "recent_losses": {},
     "bought_mints": set(),   # permanent set — never re-buy a token we've traded
+    # ── Monitoring agent / watchdog ──────────────────────────────────────
+    "last_buy_ts": 0.0,
+    "monitor_heartbeat": 0.0,
+    "spike_reject_times": [],
+    "sell_fail_total": 0,
+    "restart_times": [],
+    "watchdog_last_alert": {},   # rule -> ts (dedupe)
+    "agent_pending": {},         # suggestion id -> {"changes": [...], "summary": str}
+    "agent_last_auto_ts": 0.0,
+    "settings_changes": [],      # history of agent-driven changes (exported)
+    "export_failures": 0,
 }
 
 # ============================================================
@@ -303,6 +326,8 @@ async def init_db():
                 label INTEGER NOT NULL, created_at TIMESTAMP DEFAULT NOW());
             CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        # v2.635: per-trade details for the monitoring agent (entry stats, hold, peak, price age)
+        await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS meta JSONB")
     log.info("Database ready")
 
 async def db_save_settings():
@@ -338,13 +363,40 @@ async def db_save_trade(trade):
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO trades(symbol,mint,entry_price,exit_price,multiplier,
-            net_pnl,fees_paid,reason,is_demo,tx_sig,features)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            net_pnl,fees_paid,reason,is_demo,tx_sig,features,meta)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         """, trade.get("symbol"), trade.get("mint"), trade.get("entry"),
             trade.get("exit"), trade.get("mult"), trade.get("net_pnl"),
             trade.get("fees_paid", 0), trade.get("reason"),
             trade.get("is_demo", False), trade.get("tx_sig"),
-            json.dumps(trade.get("features", [])))
+            json.dumps(trade.get("features", [])),
+            json.dumps(trade["meta"]) if trade.get("meta") is not None else None)
+
+async def db_get_state(key, default=None):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM bot_state WHERE key=$1", key)
+    if not row: return default
+    try: return json.loads(row["value"])
+    except (TypeError, ValueError): return default
+
+async def db_set_state(key, value):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO bot_state(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2",
+            key, json.dumps(value))
+
+async def db_trades_since(last_id: int, limit=2000):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id,symbol,mint,entry_price,exit_price,multiplier,net_pnl,fees_paid,reason,"
+            "is_demo,created_at,meta FROM trades WHERE id>$1 ORDER BY id LIMIT $2", last_id, limit)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["created_at"] = d["created_at"].timestamp() if d.get("created_at") else None
+        d["meta"] = json.loads(d["meta"]) if d.get("meta") else {}
+        out.append(d)
+    return out
 
 async def db_load_trades():
     async with db_pool.acquire() as conn:
@@ -353,11 +405,12 @@ async def db_load_trades():
             t = dict(r)
             t["features"] = json.loads(t["features"]) if t["features"] else []
             closed_ts = t["created_at"].timestamp() if t.get("created_at") else 0
+            meta = json.loads(t["meta"]) if t.get("meta") else {}
             if t["is_demo"]:
                 state["demo_trades"].append({
                     "symbol": t["symbol"], "mult": t["multiplier"],
                     "net_pnl": t["net_pnl"], "reason": t["reason"],
-                    "closed_at": closed_ts,
+                    "closed_at": closed_ts, "price_age": meta.get("price_age"),
                     "projected_real": t["net_pnl"] * (
                         state["settings"]["trade_amount"] / state["settings"]["demo_trade_amount"])
                 })
@@ -365,7 +418,7 @@ async def db_load_trades():
                 state["trades_history"].append({
                     "symbol": t["symbol"], "mult": t["multiplier"],
                     "net_pnl": t["net_pnl"], "reason": t["reason"],
-                    "closed_at": closed_ts})
+                    "closed_at": closed_ts, "price_age": meta.get("price_age")})
         for r in await conn.fetch("SELECT SUM(net_pnl) as total,is_demo FROM trades GROUP BY is_demo"):
             if r["is_demo"]: state["demo_total_pnl"] = float(r["total"] or 0)
             else:            state["total_pnl"]       = float(r["total"] or 0)
@@ -1044,6 +1097,7 @@ def kb_settings():
         [InlineKeyboardButton(f"⚖️ Breakeven: {s.get('breakeven_mult',2.0)}x", callback_data="set_be_mult"),
          InlineKeyboardButton(f"🚨 Daily Loss: {s.get('daily_loss_limit_pct',20)}%", callback_data="set_daily_loss")],
         [InlineKeyboardButton(f"📐 Conviction Sizing: {'ON' if s.get('conviction_sizing') else 'OFF'}", callback_data="toggle_conviction_sizing")],
+        [InlineKeyboardButton(f"🤖 Agent: {s.get('agent_mode','auto').upper()}", callback_data="toggle_agent_mode")],
         [InlineKeyboardButton("🚨 Dump Detection Settings", callback_data="dump_detection_menu")],
         [InlineKeyboardButton("📐 Tiered Trail Settings",   callback_data="tiered_trail_menu")],
         [InlineKeyboardButton("⬅️ Back to Menu",            callback_data="main_menu")],
@@ -1322,6 +1376,7 @@ async def _real_sell_failed(app, mint, pos, reason):
     """
     n = pos.get("_sell_fail_count", 0) + 1
     pos["_sell_fail_count"] = n
+    state["sell_fail_total"] = state.get("sell_fail_total", 0) + 1
     pos["_sell_retry_at"]   = time.time() + _SELL_RETRY_SECS
     await db_save_position(mint, pos, False)
     log.error(f"REAL sell failed for {pos.get('symbol')} [{mint[:8]}] (attempt {n}) — {reason}")
@@ -1391,14 +1446,30 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
         acc    = await record_trade_outcome(pos["features"], net_pnl > 0, is_demo=is_demo)
         ml_msg = f"\n🧠 ML updated ({len(state['ml_features'])} samples)"
         if acc: ml_msg += f" | Precision: {acc:.0%}"
+    now_close = time.time()
+    meta = {
+        "entry_info": pos.get("entry_info") or {},
+        "entry_time": pos.get("entry_time"),
+        "closed_at": now_close,
+        "hold_sec": round(now_close - pos["entry_time"], 1) if pos.get("entry_time") else None,
+        "peak_mult": round(pos.get("peak_price", entry) / entry, 4) if entry > 0 else None,
+        "price_age": pos.get("_last_price_age"),
+        "stop_setting": state["settings"].get("stop_loss"),
+        "house_money": bool(hm),
+        "early_pt": bool(pos.get("pt_early_done")),
+        "milestones": [m for m in ("5x", "10x", "20x") if pos.get(f"pt_{m}_done")],
+        "realized_before_close": round(pos.get("realized_pnl", 0.0), 4),
+        "version": BOT_VERSION,
+    }
     await db_save_trade({"symbol": pos["symbol"], "mint": mint, "entry": entry, "exit": price,
         "mult": mult, "net_pnl": net_pnl, "fees_paid": pos["fees_paid"]+sell_fee,
-        "reason": reason, "is_demo": is_demo, "tx_sig": tx_sig, "features": pos.get("features",[])})
+        "reason": reason, "is_demo": is_demo, "tx_sig": tx_sig, "features": pos.get("features",[]),
+        "meta": meta})
     await db_delete_position(mint)
     if is_demo:
         state["demo_total_pnl"] += net_pnl
         state["demo_trades"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl,
-            "reason": reason, "closed_at": time.time(),
+            "reason": reason, "closed_at": time.time(), "price_age": meta["price_age"],
             "projected_real": net_pnl*(state["settings"]["trade_amount"]/state["settings"]["demo_trade_amount"])})
         del state["demo_positions"][mint]
     else:
@@ -1406,7 +1477,7 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
         _reset_daily_pnl_if_needed()
         state["daily_pnl"] += net_pnl
         state["trades_history"].append({"symbol": pos["symbol"], "mult": mult, "net_pnl": net_pnl,
-            "reason": reason, "closed_at": time.time()})
+            "reason": reason, "closed_at": time.time(), "price_age": meta["price_age"]})
         del state["positions"][mint]
     pfx       = "📝 DEMO " if is_demo else ""
     pnl_total = state["demo_total_pnl"] if is_demo else state["total_pnl"]
@@ -1701,6 +1772,17 @@ async def auto_sniper_loop(app):
                     f"├ RugCheck:   {info['rc_score']} (lower=safer)\n"
                     f"└ Risks:      {risks}\n"
                 )
+                # Entry snapshot — stored with the trade so the review agent can see
+                # which entry conditions win or lose
+                entry_info = {
+                    "liq": round(info["liquidity"]), "vol24": round(info["volume"]),
+                    "vol5m": round(info.get("vol5m", 0)), "vol5m_pct": round(info.get("vol5m_pct", 0), 1),
+                    "age_min": round(age_min, 1), "mcap": round(info["market_cap"]),
+                    "p5": info.get("price_5m", 0), "p1h": info["price_change"],
+                    "ml": round(info["ml_score"], 3), "rc": info["rc_score"], "risks": risks,
+                    "b5": pair.get("txns", {}).get("m5", {}).get("buys"),
+                    "s5": pair.get("txns", {}).get("m5", {}).get("sells"),
+                }
                 if s["demo_mode"]:
                     price = await get_token_price(mint, pair_data=pair)
                     if price <= 0: continue
@@ -1710,9 +1792,10 @@ async def auto_sniper_loop(app):
                             "token_amount": (amt-fees["total"])/price,
                             "tp_hit": False, "features": info["features"], "ml_score": info["ml_score"],
                             "auto": True, "entry_time": time.time(), "peak_vol5m": 0.0,
-                            "pt_early_done": False}
+                            "pt_early_done": False, "entry_info": entry_info}
                     state["demo_positions"][mint] = pos
                     state["bought_mints"].add(mint)
+                    state["last_buy_ts"] = time.time()
                     await db_save_position(mint, pos, True)
                     await _safe_notify(app, notif + f"\n📝 *DEMO Auto-bought @ ${price:.6f}*")
                 elif s["auto_snipe"]:
@@ -1733,9 +1816,10 @@ async def auto_sniper_loop(app):
                                 "token_amount": result["out_amount"], "fees_paid": fees["total"],
                                 "tp_hit": False, "features": info["features"], "auto": True,
                                 "entry_time": time.time(), "peak_vol5m": 0.0,
-                                "pt_early_done": False}
+                                "pt_early_done": False, "entry_info": entry_info}
                         state["positions"][mint] = pos
                         state["bought_mints"].add(mint)
+                        state["last_buy_ts"] = time.time()
                         await db_save_position(mint, pos, False)
                         await _safe_notify(app, f"✅ *Sniped {info['symbol']}!*\nEntry: ${price:.6f}\n"
                             f"🔗 [Solscan](https://solscan.io/tx/{result['signature']})")
@@ -1814,6 +1898,8 @@ async def _accept_position_price(app, mint: str, pos: dict, price: float, is_dem
     if ratio and ref > 0 and price / ref >= ratio:
         confirm = await _confirm_price(mint)
         if not (confirm > 0 and 0.75 <= confirm / price <= 1.33):
+            state["spike_reject_times"] = [t for t in state["spike_reject_times"]
+                                           if time.time() - t < 3600] + [time.time()]
             log.warning(f"price spike REJECTED {pos.get('symbol')} [{mint[:8]}]: "
                         f"{price/ref:.1f}x jump vs last good ${ref:.8f}, confirm=${confirm:.8f}")
             if not pos.get("_spike_warned"):
@@ -1836,6 +1922,7 @@ async def monitor_positions(app):
 
     while True:
         await asyncio.sleep(0.5)
+        state["monitor_heartbeat"] = time.time()   # watched by the stall alert
 
         # ── Real-time price health watchdog ─────────────────────────────────
         a  = state["api_stats"]
@@ -1880,6 +1967,7 @@ async def monitor_positions(app):
                     if not await _accept_position_price(app, mint, pos, price, is_demo):
                         continue
                     pos["current_price"] = price
+                    pos["_last_price_age"] = p_age if p_age != float("inf") else None
                     entry = pos["entry_price"]; mult = price / entry
                     # Cost basis per token, captured once on the position's first tick
                     # (before any partial sell can reduce token_amount). Used to correctly
@@ -2081,6 +2169,234 @@ async def monitor_positions(app):
                         await _close_position(app, mint, pos, price, reason, is_demo)
                 except Exception as e:
                     log_error(f"monitor/{mint[:8]}", e)
+
+# ============================================================
+# MONITORING AGENT — watchdog alerts, GitHub uploads, suggestions
+# ============================================================
+_WATCHDOG_COOLDOWN = {"stalled": 600, "stops": 6*3600, "winrate": 6*3600, "streak": 3*3600,
+                      "idle": 3*3600, "spikes": 3600, "restarts": 3600, "export": 6*3600}
+
+async def _watchdog_alert(app, rule, text) -> bool:
+    now  = time.time()
+    last = state["watchdog_last_alert"].get(rule, 0)
+    if now - last < _WATCHDOG_COOLDOWN.get(rule, 3600):
+        return False
+    state["watchdog_last_alert"][rule] = now
+    try: await db_set_state("watchdog_last_alert", state["watchdog_last_alert"])
+    except Exception as e: log_error("watchdog/save", e)
+    await _safe_notify(app, f"🐕 *Watchdog*\n{text}")
+    return True
+
+def _watchdog_trades(since_ts: float):
+    """Trades for the active mode closed since the watchdog epoch, oldest first."""
+    pool = state["demo_trades"] if state["settings"].get("demo_mode") else state["trades_history"]
+    return sorted((t for t in pool if (t.get("closed_at") or 0) >= since_ts),
+                  key=lambda t: t.get("closed_at") or 0)
+
+async def watchdog_loop(app):
+    # Rules only judge trades closed after the watchdog first started, so the
+    # pre-fix history doesn't trigger alerts on the first deploy.
+    since = await db_get_state("watchdog_since", None)
+    if not since:
+        since = time.time(); await db_set_state("watchdog_since", since)
+    state["watchdog_last_alert"].update(await db_get_state("watchdog_last_alert", {}) or {})
+    await asyncio.sleep(60)
+    while True:
+        try:
+            s      = state["settings"]
+            trades = _watchdog_trades(since)
+            n_open = len(state["positions"]) + len(state["demo_positions"])
+            active = bool(s.get("demo_mode") or s.get("auto_snipe"))
+            for rule, text in (
+                ("stalled", AL.check_monitor_stalled(state["monitor_heartbeat"], n_open)),
+                ("stops",   AL.check_stop_slippage(trades, s.get("stop_loss", 0.9))),
+                ("winrate", AL.check_win_rate(trades)),
+                ("streak",  AL.check_losing_streak(trades)),
+                ("idle",    AL.check_no_trades(state["last_buy_ts"], active)),
+                ("spikes",  AL.check_spike_rejects(state["spike_reject_times"])),
+            ):
+                if text: await _watchdog_alert(app, rule, text)
+        except Exception as e:
+            log_error("watchdog_loop", e)
+        await asyncio.sleep(60)
+
+async def _record_restart(app):
+    now = time.time()
+    rt  = [t for t in (await db_get_state("restart_times", []) or []) if now - t < 3600] + [now]
+    state["restart_times"] = rt
+    await db_set_state("restart_times", rt)
+    text = AL.check_restart_loop(rt)
+    if text: await _watchdog_alert(app, "restarts", text)
+
+def _open_positions_summary():
+    out = []
+    for is_demo, pool in ((False, state["positions"]), (True, state["demo_positions"])):
+        for m, p in pool.items():
+            e = p.get("entry_price") or 0; c = p.get("current_price") or e
+            out.append({"mint": m, "symbol": p.get("symbol"), "is_demo": is_demo,
+                        "entry_price": e, "current_price": c,
+                        "mult": round(c / e, 4) if e else None,
+                        "age_min": round((time.time() - p.get("entry_time", time.time())) / 60, 1),
+                        "entry_info": p.get("entry_info")})
+    return out
+
+async def export_snapshot():
+    """Upload trades closed since the last upload (+ settings, health) to the private repo."""
+    last_id = int(await db_get_state("export_last_trade_id", 0) or 0)
+    trades  = await db_trades_since(last_id, limit=1000)
+    now     = time.time()
+    counters = {
+        "api_stats": {k: v for k, v in state["api_stats"].items()},
+        "spike_rejects_1h": len([t for t in state["spike_reject_times"] if now - t < 3600]),
+        "sell_fail_total": state.get("sell_fail_total", 0),
+        "restarts_1h": len([t for t in state["restart_times"] if now - t < 3600]),
+        "last_buy_age_min": round((now - state["last_buy_ts"]) / 60, 1) if state["last_buy_ts"] else None,
+        "monitor_heartbeat_age_s": round(now - state["monitor_heartbeat"], 1) if state["monitor_heartbeat"] else None,
+        "sniper_paused_until": state.get("sniper_paused_until", 0),
+        "daily_pnl": state.get("daily_pnl", 0.0),
+    }
+    snap = AL.build_snapshot(
+        trades=trades, settings=state["settings"], open_positions=_open_positions_summary(),
+        counters=counters, demo_total_pnl=state["demo_total_pnl"],
+        ml_samples=len(state["ml_features"]), version=BOT_VERSION,
+        settings_changes=state["settings_changes"][-20:], now=now)
+    sess = await _get_session()
+    await GITHUB_DATA.put_file(sess, AL.snapshot_path(now), json.dumps(snap, default=str),
+                               f"snapshot: {len(trades)} trades ({BOT_VERSION})")
+    if trades:
+        await db_set_state("export_last_trade_id", trades[-1]["id"])
+    log.info(f"Agent snapshot uploaded: {len(trades)} trades")
+    return len(trades)
+
+async def export_loop(app):
+    if not GITHUB_DATA.enabled:
+        log.info("Agent uploads disabled (set GITHUB_TOKEN and GITHUB_DATA_REPO)"); return
+    await asyncio.sleep(90)
+    while True:
+        try:
+            n = await export_snapshot()
+            state["export_failures"] = 0
+            # Catch up quickly if there's a backlog (first run uploads full history)
+            if n >= 1000:
+                await asyncio.sleep(20); continue
+        except Exception as e:
+            state["export_failures"] += 1
+            log_error("export_loop", e)
+            if state["export_failures"] >= 3:
+                await _watchdog_alert(app, "export",
+                    f"📤 *GitHub upload failing* ({state['export_failures']}x)\n"
+                    f"`{escape_md(str(e))[:160]}`\nCheck GITHUB_TOKEN / GITHUB_DATA_REPO on Railway.")
+        await asyncio.sleep(EXPORT_EVERY_SEC)
+
+def _fmt_changes(changes):
+    return "\n".join(
+        f"• *{c['key']}*: {AL.fmt_value(c['key'], c.get('from'))} → *{AL.fmt_value(c['key'], c['to'])}*"
+        + (f"\n   _{escape_md(c['why'])}_" if c.get("why") else "")
+        for c in changes)
+
+async def _agent_respond(sug_id, status, applied=None, rejected=None, note=""):
+    """Tell the review agent what happened to its suggestion (control/responses/<id>.json)."""
+    if not GITHUB_DATA.enabled: return
+    body = {"id": sug_id, "status": status, "applied": applied or [], "rejected": rejected or [],
+            "note": note, "at": time.time(), "mode": state["settings"].get("agent_mode"),
+            "settings_now": {k: state["settings"].get(k) for k in AL.AGENT_BOUNDS}}
+    try:
+        sess = await _get_session()
+        await GITHUB_DATA.put_file(sess, f"control/responses/{sug_id}.json",
+                                   json.dumps(body, indent=1, default=str), f"response {sug_id}: {status}")
+    except Exception as e:
+        log_error("agent_respond", e)
+
+async def _apply_agent_changes(app, sug_id, changes, summary, auto: bool):
+    # Re-validate against the CURRENT settings — they may have changed since the suggestion
+    accepted, rejected = AL.validate_changes(
+        [{"key": c["key"], "to": c["to"], "why": c.get("why", "")} for c in changes], state["settings"])
+    now = time.time()
+    for c in accepted:
+        state["settings"][c["key"]] = c["to"]
+        state["settings_changes"].append({"id": sug_id, "at": now, "key": c["key"], "from": c["from"],
+                                          "to": c["to"], "why": c.get("why", ""), "auto": auto})
+    state["settings_changes"] = state["settings_changes"][-100:]
+    if accepted:
+        await db_save_settings()
+        await db_set_state("settings_changes", state["settings_changes"])
+        if auto:
+            state["agent_last_auto_ts"] = now
+            await db_set_state("agent_last_auto_ts", now)
+    state["agent_pending"].pop(sug_id, None)
+    await db_set_state("agent_pending", state["agent_pending"])
+    await _agent_respond(sug_id, "applied" if accepted else "nothing_applied", accepted, rejected,
+                         "auto" if auto else "approved by user")
+    head = "🤖 *Agent applied changes* (demo auto-mode)" if auto else "✅ *Changes applied*"
+    rej  = f"\n\n_Skipped: {len(rejected)} (out of bounds or already changed)_" if rejected else ""
+    kb   = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Undo", callback_data=f"agent_undo:{sug_id}")]]) if accepted else None
+    await app.bot.send_message(chat_id=AUTHORIZED_USER,
+        text=f"{head}\n\n{escape_md(summary)}\n\n{_fmt_changes(accepted) or '_No changes_'}{rej}",
+        parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+    return accepted
+
+async def _undo_agent_changes(sug_id):
+    undone = []
+    for ch in reversed([c for c in state["settings_changes"] if c["id"] == sug_id and not c.get("undone")]):
+        if state["settings"].get(ch["key"]) == ch["to"] and ch["from"] is not None:
+            state["settings"][ch["key"]] = ch["from"]
+            ch["undone"] = True; undone.append(ch)
+    if undone:
+        await db_save_settings()
+        await db_set_state("settings_changes", state["settings_changes"])
+        await _agent_respond(sug_id, "undone", undone, [], "user pressed Undo")
+    return undone
+
+async def check_agent_suggestion(app):
+    sess = await _get_session()
+    text, _ = await GITHUB_DATA.get_file(sess, "control/suggestions.json")
+    sug = AL.parse_suggestion(text) if text else None
+    if not sug: return None
+    sug_id = str(sug["id"])[:40]
+    seen = await db_get_state("agent_seen_ids", []) or []
+    if sug_id in seen: return None
+    await db_set_state("agent_seen_ids", (seen + [sug_id])[-50:])
+
+    s        = state["settings"]
+    mode     = s.get("agent_mode", "auto")
+    summary  = str(sug.get("summary", ""))[:700]
+    accepted, rejected = AL.validate_changes(sug.get("changes", []), s)
+    if mode == "off":
+        await _agent_respond(sug_id, "ignored", [], rejected, "agent_mode is off"); return "ignored"
+    if not accepted:
+        rej = f"\n\n_Rejected {len(rejected)} change(s): out of bounds._" if rejected else ""
+        await _safe_notify(app, f"🤖 *Agent review* — no setting changes\n\n{escape_md(summary)}{rej}")
+        await _agent_respond(sug_id, "no_changes", [], rejected); return "no_changes"
+
+    real_live = bool(s.get("auto_snipe") and not s.get("demo_mode"))
+    cooled    = time.time() - state["agent_last_auto_ts"] >= AL.AUTO_APPLY_COOLDOWN_SEC
+    if mode == "auto" and not real_live and cooled and sug.get("auto_apply_ok", True):
+        await _apply_agent_changes(app, sug_id, accepted, summary, auto=True); return "auto_applied"
+
+    state["agent_pending"][sug_id] = {"changes": accepted, "summary": summary}
+    await db_set_state("agent_pending", state["agent_pending"])
+    why = ("Real trading is on, so auto-apply is paused." if (mode == "auto" and real_live)
+           else "Auto-apply cooldown is still running." if (mode == "auto" and not cooled)
+           else "")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"agent_ok:{sug_id}"),
+                                InlineKeyboardButton("❌ Reject",  callback_data=f"agent_no:{sug_id}")]])
+    await app.bot.send_message(chat_id=AUTHORIZED_USER,
+        text=(f"🤖 *Agent suggestion*\n\n{escape_md(summary)}\n\n{_fmt_changes(accepted)}"
+              + (f"\n\n_{why}_" if why else "")),
+        parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+    await _agent_respond(sug_id, "awaiting_approval", accepted, rejected)
+    return "pending"
+
+async def suggestion_loop(app):
+    if not GITHUB_DATA.enabled: return
+    state["agent_pending"]     = await db_get_state("agent_pending", {}) or {}
+    state["settings_changes"]  = await db_get_state("settings_changes", []) or []
+    state["agent_last_auto_ts"] = float(await db_get_state("agent_last_auto_ts", 0) or 0)
+    await asyncio.sleep(120)
+    while True:
+        try: await check_agent_suggestion(app)
+        except Exception as e: log_error("suggestion_loop", e)
+        await asyncio.sleep(SUGGESTION_POLL_SEC)
 
 # ============================================================
 # CALLBACK HANDLER
@@ -2664,6 +2980,44 @@ async def _button_handler_inner(update, ctx, q, data):
             f"🚨 *Daily Loss Limit*\nCurrent: {state['settings'].get('daily_loss_limit_pct',20)}%\n\nSend new %:",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_DAILY_LOSS
 
+    # ── Monitoring agent ─────────────────────────────────────────────────────
+    elif data == "toggle_agent_mode":
+        order = ["auto", "suggest", "off"]
+        cur   = state["settings"].get("agent_mode", "auto")
+        state["settings"]["agent_mode"] = order[(order.index(cur) + 1) % 3] if cur in order else "auto"
+        await db_save_settings()
+        expl = {"auto": "applies suggestions itself (demo only, within safe limits)",
+                "suggest": "asks you to Approve / Reject each suggestion",
+                "off": "ignores suggestions (alerts and uploads still run)"}[state["settings"]["agent_mode"]]
+        await q.edit_message_text(
+            f"⚙️ *Settings*\n\n🤖 Agent mode: *{state['settings']['agent_mode'].upper()}* — {expl}",
+            parse_mode="Markdown", reply_markup=kb_settings())
+
+    elif data.startswith("agent_ok:"):
+        sug_id  = data.split(":", 1)[1]
+        pending = state["agent_pending"].get(sug_id)
+        if not pending:
+            await q.edit_message_text("⚠️ That suggestion has expired or was already handled."); return
+        await q.edit_message_reply_markup(reply_markup=None)
+        await _apply_agent_changes(app, sug_id, pending["changes"], pending.get("summary", ""), auto=False)
+
+    elif data.startswith("agent_no:"):
+        sug_id = data.split(":", 1)[1]
+        state["agent_pending"].pop(sug_id, None)
+        await db_set_state("agent_pending", state["agent_pending"])
+        await _agent_respond(sug_id, "rejected", [], [], "rejected by user")
+        await q.edit_message_reply_markup(reply_markup=None)
+        await app.bot.send_message(chat_id=AUTHORIZED_USER, text="❌ Agent suggestion rejected. Settings unchanged.")
+
+    elif data.startswith("agent_undo:"):
+        sug_id = data.split(":", 1)[1]
+        undone = await _undo_agent_changes(sug_id)
+        await q.edit_message_reply_markup(reply_markup=None)
+        msg = ("↩️ *Undone:*\n" + "\n".join(
+                   f"• {c['key']} back to {AL.fmt_value(c['key'], c['from'])}" for c in undone)
+               if undone else "Nothing to undo (settings were changed again since).")
+        await app.bot.send_message(chat_id=AUTHORIZED_USER, text=msg, parse_mode="Markdown")
+
     elif data == "toggle_conviction_sizing":
         state["settings"]["conviction_sizing"] = not state["settings"].get("conviction_sizing", True)
         await db_save_settings()
@@ -2991,15 +3345,22 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def post_init(app):
     await init_db(); await load_all_from_db()
+    state["last_buy_ts"] = time.time()   # idle alert counts from startup
     asyncio.create_task(monitor_positions(app))
     asyncio.create_task(auto_sniper_loop(app))
+    # Monitoring agent: watchdog alerts always; uploads + suggestions need GITHUB_* vars
+    asyncio.create_task(watchdog_loop(app))
+    asyncio.create_task(export_loop(app))
+    asyncio.create_task(suggestion_loop(app))
+    try: await _record_restart(app)
+    except Exception as e: log_error("record_restart", e)
     if HELIUS_RPC and ENABLE_RAYDIUM_WS_SNIPER:
         asyncio.create_task(raydium_ws_sniper(app))
         log.info("Raydium WS sniper started")
     else:
         log.info("Raydium WS sniper disabled (set ENABLE_RAYDIUM_WS_SNIPER=true to enable — note: burns Helius credits fast)")
     log.info("All systems go")
-    await _safe_notify(app, "🚀 *Bot restarted — all state restored.*\n\nSend /start to open the dashboard.")
+    await _safe_notify(app, f"🚀 *Bot restarted ({BOT_VERSION}) — all state restored.*\n\nSend /start to open the dashboard.")
 
 async def raydium_ws_sniper(app):
     try: import websockets
