@@ -18,6 +18,7 @@ bot_scaler.pkl
 
 # Logs (Railway has its own log viewer)
 *.log
+*.log.*
 
 # Virtual environment
 venv/

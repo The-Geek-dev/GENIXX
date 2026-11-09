@@ -124,6 +124,7 @@ WAITING_SET_PRICE1H_MAX_PCT      = 55  # max 1h pump % before rejecting (already
 WAITING_SET_PUMP_EXHAUSTION      = 56  # exhaustion ratio: 5m must be >= this fraction of 1h
 WAITING_SET_MAX_MOMENTUM_PRODUCT = 57  # 5m% × 1h% combined cap — blocks late FOMO entries
 WAITING_SET_ENTRY_BS_RATIO       = 58  # min buy/sell transaction ratio at entry
+WAITING_SET_PRICE5M_MAX_PCT      = 59  # max 5m pump % before rejecting (anti-chase)
 
 def validate_config():
     missing = [k for k, v in {
@@ -199,6 +200,12 @@ state = {
         "pump_exhaustion_ratio": 0.05,   # reject if 5m% < this fraction of 1h% — catches stalling pumps (0 = disabled)
         "max_momentum_product": 10000.0, # 5m% × 1h% cap — blocks late FOMO: CHIBIWHALE=61770 ❌ WOMI=9226 ✅ (0=disabled)
         "min_entry_bs_ratio": 1.2,       # min buys/sells ratio in 5m window at entry — blocks distribution (0=disabled)
+        "price5m_max_pct":     30.0,     # reject tokens already up MORE than this % in 5m (0 = disabled) — don't chase spikes.
+                                         # Nov 2026 export: 5m>30% entries lost money in Sept–Nov AND Mar–Jun data.
+        # ── Price-feed safety ────────────────────────────────────────────────
+        "price_spike_ratio":   3.0,      # a position price ≥ this × last accepted price must be confirmed
+                                         # by a fresh DexScreener read before it is used (0 = disabled).
+                                         # Blocks phantom ticks like OPNUSDT 138x / WTF 630x.
         # Position limits
         "max_demo_positions": 5,
         "max_real_positions": 3,
@@ -555,8 +562,15 @@ async def _safe_notify(app, text):
 # TOKEN DATA & PRICING
 # ============================================================
 _price_cache: dict = {}
-_PRICE_CACHE_TTL      = 12.0   # extended: reduces re-fetch frequency for active positions
+_PRICE_CACHE_TTL      = 12.0   # default TTL for discovery / dashboard lookups
 _PRICE_CACHE_FAIL_TTL = 5.0    # wait longer before retrying a failed mint
+# Open positions must NOT run on 12s-old prices: the Nov 2026 export showed stop-loss
+# exits averaging 0.77x against a 0.9x stop because the stop was evaluated on stale data.
+_POS_PRICE_MAX_AGE    = 2.0    # max cache age (s) accepted when pricing an OPEN position
+_POS_BATCH_MIN_INTERVAL = 1.0  # min seconds between batch Jupiter calls (keeps us under rate limits
+                               # so the circuit breaker doesn't open and force us onto stale fallbacks)
+_last_pos_batch_ts    = 0.0
+_last_pos_batch       = {}     # {mint: (ts, price)} from the most recent batch call
 _rugcheck_cache: dict = {}
 _RUGCHECK_CACHE_TTL   = 1800   # 30 min — was 5 min, extended to survive rate limit bursts
 _rugcheck_rate_limited_until = 0.0   # circuit breaker: back off entire RugCheck API when 429d
@@ -628,7 +642,12 @@ async def batch_jupiter_prices(mints: list[str]) -> dict[str, float]:
         log.debug(f"batch_jupiter_prices error: {e}")
     return {}
 
-async def get_token_price(mint: str, pair_data: dict = None) -> float:
+def price_age(mint: str) -> float:
+    """Seconds since the cached price for this mint was observed (inf if none)."""
+    entry = _price_cache.get(mint)
+    return (time.time() - entry[0]) if entry else float("inf")
+
+async def get_token_price(mint: str, pair_data: dict = None, max_age: float = None) -> float:
     """
     Fetch token price with a 4-source fallback chain and circuit breakers.
     Sources tried in order (skipped if circuit is open due to rate limiting):
@@ -651,10 +670,11 @@ async def get_token_price(mint: str, pair_data: dict = None) -> float:
             pass
 
     now = time.time()
+    ttl = _PRICE_CACHE_TTL if max_age is None else max_age
     # Short-circuit on fresh cached value — avoids hammering APIs
     if mint in _price_cache:
         ts, p = _price_cache[mint]
-        if p > 0 and now - ts < _PRICE_CACHE_TTL:         return p
+        if p > 0 and now - ts < ttl:                      return p
         if p == 0.0 and now - ts < _PRICE_CACHE_FAIL_TTL: return 0.0
 
     sess = await _get_session()
@@ -1015,7 +1035,8 @@ def kb_settings():
         [InlineKeyboardButton(f"🚀 Max 1h Pump: {'OFF' if not s.get('price1h_max_pct',500) else str(int(s.get('price1h_max_pct',500)))+'%'}", callback_data="set_price1h_max_pct"),
          InlineKeyboardButton(f"😮 Exhaustion Ratio: {s.get('pump_exhaustion_ratio',0.05)}", callback_data="set_pump_exhaustion")],
         [InlineKeyboardButton(f"🔥 Max Momentum: {'OFF' if not s.get('max_momentum_product',10000) else str(int(s.get('max_momentum_product',10000)))}", callback_data="set_max_momentum_product")],
-        [InlineKeyboardButton(f"📊 Entry B/S Ratio: {s.get('min_entry_bs_ratio',1.2)}", callback_data="set_entry_bs_ratio")],
+        [InlineKeyboardButton(f"📊 Entry B/S Ratio: {s.get('min_entry_bs_ratio',1.2)}", callback_data="set_entry_bs_ratio"),
+         InlineKeyboardButton(f"🏃 Max 5m Pump: {'OFF' if not s.get('price5m_max_pct',30) else str(int(s.get('price5m_max_pct',30)))+'%'}", callback_data="set_price5m_max_pct")],
         [InlineKeyboardButton(f"📂 Max Demo: {s.get('max_demo_positions',5)}",  callback_data="set_max_demo"),
          InlineKeyboardButton(f"📂 Max Real: {s.get('max_real_positions',3)}",  callback_data="set_max_real")],
         [InlineKeyboardButton(hm,  callback_data="toggle_house_money"),
@@ -1291,7 +1312,29 @@ async def _early_profit_take(app, mint, pos, current_price, mult, is_demo: bool)
 # ============================================================
 # CLOSE POSITION
 # ============================================================
+_SELL_RETRY_SECS = 10
+
+async def _real_sell_failed(app, mint, pos, reason):
+    """
+    A REAL exit sell failed. Previously the position was recorded as closed at an
+    estimated price and deleted — leaving the tokens in the wallet, untracked and
+    unmanaged. Now we keep the position and retry after _SELL_RETRY_SECS.
+    """
+    n = pos.get("_sell_fail_count", 0) + 1
+    pos["_sell_fail_count"] = n
+    pos["_sell_retry_at"]   = time.time() + _SELL_RETRY_SECS
+    await db_save_position(mint, pos, False)
+    log.error(f"REAL sell failed for {pos.get('symbol')} [{mint[:8]}] (attempt {n}) — {reason}")
+    if n == 1 or n % 5 == 0:
+        await _safe_notify(app,
+            f"🚨 *SELL FAILED — {pos.get('symbol')}* (attempt {n})\n"
+            f"Exit reason: {reason}\n"
+            f"Position kept open; retrying every {_SELL_RETRY_SECS}s.\n"
+            f"_Check Jupiter/RPC — or sell manually._")
+
 async def _close_position(app, mint, pos, price, reason, is_demo=False):
+    if not is_demo and time.time() < pos.get("_sell_retry_at", 0):
+        return   # waiting out the retry delay after a failed sell
     entry = pos["entry_price"]
     mult  = price / entry if entry > 0 else 1
     hm    = pos.get("capital_recovered", False)
@@ -1305,6 +1348,8 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
             proj_txt = f"💡 Real projection: *${proj:+.2f}*\n"
         else:
             sell_r   = await execute_sell(mint, token_amt)
+            if not sell_r:
+                return await _real_sell_failed(app, mint, pos, reason)
             usdc_bk  = sell_r["usdc_received"] if sell_r else gross * 0.997
             sell_fee = calc_fees(usdc_bk)["dex_fee"]
             net_pnl  = usdc_bk - sell_fee
@@ -1333,6 +1378,8 @@ async def _close_position(app, mint, pos, price, reason, is_demo=False):
             proj_txt = f"💡 Real projection: *${proj:+.2f}*\n"
         else:
             sell_r   = await execute_sell(mint, remaining_tokens)
+            if not sell_r:
+                return await _real_sell_failed(app, mint, pos, reason)
             usdc_bk  = sell_r["usdc_received"] if sell_r else remaining_tokens*price*0.997
             sell_fee = calc_fees(usdc_bk)["dex_fee"]
             final_leg_pnl = usdc_bk - remaining_cost
@@ -1502,6 +1549,10 @@ async def evaluate_new_token(pair):
         price5m_min_pct = price5m_young_min_pct
     price5m_fails = (price_5m < price5m_min_pct)
 
+    # ── Max 5m pump — don't chase a spike that's already happened ────────────
+    price5m_max_pct = s.get("price5m_max_pct", 30.0)  # 0 = disabled
+    price5m_chasing = (price5m_max_pct > 0 and price_5m > price5m_max_pct)
+
     # ── Max token age filter — keeps bot focused on fresh/young coins ─────────
     max_age_sec  = s.get("max_token_age_sec", 0)  # 0 = disabled
     age_too_old  = (max_age_sec > 0 and age_sec > max_age_sec)
@@ -1548,7 +1599,7 @@ async def evaluate_new_token(pair):
               and not rc_too_risky and age_sec >= min_age_sec and vol5m_pct >= min_vol5m_pct
               and not price5m_fails and not age_too_old and not price1h_fails
               and not already_pumped and not exhaustion_fails and not momentum_overheated
-              and not entry_bs_fails)
+              and not entry_bs_fails and not price5m_chasing)
     if not passes:
         reasons = []
         if liq < min_liq:             reasons.append(f"liq=${liq:,.0f}<${min_liq:,.0f}")
@@ -1561,6 +1612,8 @@ async def evaluate_new_token(pair):
         if price5m_fails:
             bracket = f"old(>{price5m_filter_age_sec//60}min)" if age_sec >= price5m_filter_age_sec else f"young(<{price5m_filter_age_sec//60}min)"
             reasons.append(f"price5m={price_5m:.1f}%<{price5m_min_pct:.1f}% required [{bracket}]")
+        if price5m_chasing:
+            reasons.append(f"price5m={price_5m:.1f}%>{price5m_max_pct:.0f}% (chasing spike)")
         if price1h_fails:
             reasons.append(f"price1h={price_1h:.1f}%<{price1h_old_min_pct:.1f}% (1h dump guard)")
         if already_pumped:
@@ -1705,6 +1758,77 @@ def _tiered_trail(peak_mult: float) -> float:
     if peak_mult >= 5:  return s.get("trail_5x",  4.0) / 100
     return 0.05
 
+async def _position_prices(mints: list[str]) -> dict[str, tuple[float, float]]:
+    """
+    Price every open position for this tick. Returns {mint: (price, age_seconds)}.
+
+    • Batch Jupiter call, at most once per _POS_BATCH_MIN_INTERVAL. Calling it every
+      0.5s tick risks 429s, and a 429 opens the circuit breaker for 10–120s, pushing
+      every position onto slower fallbacks.
+    • Anything the batch misses falls back to get_token_price with a SHORT max_age,
+      instead of the 12s discovery TTL that let stops fire on stale prices.
+    """
+    global _last_pos_batch_ts, _last_pos_batch
+    now = time.time()
+    if now - _last_pos_batch_ts >= _POS_BATCH_MIN_INTERVAL:
+        _last_pos_batch_ts = now
+        fresh = await batch_jupiter_prices(mints)
+        _last_pos_batch = {m: (now, p) for m, p in fresh.items()}
+
+    out: dict[str, tuple[float, float]] = {}
+    missing = []
+    for m in mints:
+        hit = _last_pos_batch.get(m)
+        if hit and hit[1] > 0 and now - hit[0] <= _POS_PRICE_MAX_AGE:
+            out[m] = (hit[1], now - hit[0])
+        else:
+            missing.append(m)
+    if missing:
+        results = await asyncio.gather(
+            *[get_token_price(m, max_age=_POS_PRICE_MAX_AGE) for m in missing],
+            return_exceptions=True)
+        for m, p in zip(missing, results):
+            if isinstance(p, float) and p > 0:
+                out[m] = (p, price_age(m))
+    return out
+
+async def _confirm_price(mint: str) -> float:
+    """Independent, uncached price read from DexScreener (0.0 on failure)."""
+    td = await get_token_data(mint)
+    try:
+        return float((td or {}).get("priceUsd", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+async def _accept_position_price(app, mint: str, pos: dict, price: float, is_demo: bool) -> bool:
+    """
+    Phantom-spike guard. Returns False if this tick's price should be ignored.
+
+    Only UPWARD jumps are checked: a jump of ≥ price_spike_ratio × the last accepted
+    price must be confirmed by a fresh DexScreener read within ±25%. Downward moves are
+    never blocked — stops must always be able to fire on a real dump.
+    """
+    s     = state["settings"]
+    ratio = s.get("price_spike_ratio", 3.0)
+    ref   = pos.get("last_good_price") or pos.get("entry_price", 0)
+    if ratio and ref > 0 and price / ref >= ratio:
+        confirm = await _confirm_price(mint)
+        if not (confirm > 0 and 0.75 <= confirm / price <= 1.33):
+            log.warning(f"price spike REJECTED {pos.get('symbol')} [{mint[:8]}]: "
+                        f"{price/ref:.1f}x jump vs last good ${ref:.8f}, confirm=${confirm:.8f}")
+            if not pos.get("_spike_warned"):
+                pos["_spike_warned"] = True
+                pfx = "📝 DEMO " if is_demo else ""
+                await _safe_notify(app,
+                    f"⚠️ {pfx}*Price spike ignored — {pos.get('symbol')}*\n"
+                    f"Feed jumped {price/ref:.1f}x in one tick but DexScreener "
+                    f"{'did not confirm' if confirm > 0 else 'returned no price'}.\n"
+                    f"_Holding position on last good price until feeds agree._")
+            return False
+        log.info(f"price spike CONFIRMED {pos.get('symbol')}: {price/ref:.1f}x (dexscreener ${confirm:.8f})")
+    pos["last_good_price"] = price
+    return True
+
 async def monitor_positions(app):
     log.info("Position monitor started.")
     price_history: dict = {}  # mint -> [(timestamp, price), ...]
@@ -1740,28 +1864,21 @@ async def monitor_positions(app):
             mints = list(pool.keys())
             if not mints: continue
 
-            # ── Batch price fetch: one Jupiter call for all positions ─────────
-            # Falls back to individual get_token_price only for mints that miss
-            price_map: dict[str, float] = {}
-            batch_result = await batch_jupiter_prices(mints)
-            price_map.update(batch_result)
-            # Individual fallback for any mint not returned by batch
-            missing = [m for m in mints if m not in price_map or price_map[m] <= 0]
-            if missing:
-                fallback_results = await asyncio.gather(
-                    *[get_token_price(m) for m in missing], return_exceptions=True)
-                for m, p in zip(missing, fallback_results):
-                    if isinstance(p, float) and p > 0:
-                        price_map[m] = p
+            # ── Fresh prices for open positions (≤ _POS_PRICE_MAX_AGE old) ────
+            price_map = await _position_prices(mints)
 
             for mint, pos in list(pool.items()):
                 try:
-                    price = price_map.get(mint, 0.0)
+                    price, p_age = price_map.get(mint, (0.0, float("inf")))
                     if price <= 0:
                         # One immediate retry before skipping this tick
                         await asyncio.sleep(0.3)
-                        price = await get_token_price(mint)
+                        price = await get_token_price(mint, max_age=_POS_PRICE_MAX_AGE)
+                        p_age = price_age(mint)
                     if price <= 0: continue
+                    # Phantom-spike guard — skip this tick if an implausible jump isn't confirmed
+                    if not await _accept_position_price(app, mint, pos, price, is_demo):
+                        continue
                     pos["current_price"] = price
                     entry = pos["entry_price"]; mult = price / entry
                     # Cost basis per token, captured once on the position's first tick
@@ -1803,9 +1920,12 @@ async def monitor_positions(app):
                         await _early_profit_take(app, mint, pos, price, mult, is_demo)
 
                     # ── Tiered profit-take milestones (5x / 10x / 20x) ──────
+                    # At most ONE milestone per tick: a single price can't really fill three
+                    # sells (OPNUSDT/WTF fired 5x+10x+20x in the same second on a bad tick).
                     for milestone, threshold in [("5x", 5.0), ("10x", 10.0), ("20x", 20.0)]:
                         if mult >= threshold and not pos.get(f"pt_{milestone}_done"):
                             await _tiered_profit_take(app, mint, pos, price, milestone, is_demo)
+                            break
 
                     # ── Live 5m volume tracking ──────────────────────────────
                     b5m_live = 0.0; s5m_live = 0.0; vol5m_live = 0.0
@@ -1828,7 +1948,9 @@ async def monitor_positions(app):
 
                     # ── Hard stops (always active, no signal counting) ───────
                     if mult <= sl:
-                        reason = f"🔴 Stop Loss at {mult:.2f}x"
+                        # Price age is logged so future exports can measure feed lag vs slippage
+                        age_txt = f", price {p_age:.1f}s old" if p_age != float("inf") else ""
+                        reason = f"🔴 Stop Loss at {mult:.2f}x (stop {sl}x{age_txt})"
                     elif pos.get("breakeven_active") and price <= entry:
                         reason = f"🔒 Breakeven Stop at {mult:.2f}x"
 
@@ -2406,6 +2528,23 @@ async def _button_handler_inner(update, ctx, q, data):
             f"Send a value (e.g. `500`):",
             parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRICE1H_MAX_PCT
 
+    elif data == "set_price5m_max_pct":
+        ctx.user_data["setting"] = "price5m_max_pct"
+        cur = state["settings"].get("price5m_max_pct", 30.0)
+        await q.edit_message_text(
+            f"🏃 *Max 5m Pump*\n\n"
+            f"Current: *{'OFF' if cur == 0 else f'{cur:.0f}%'}*\n\n"
+            f"Rejects tokens already up *more* than this % in the last 5 minutes.\n"
+            f"Stops the bot buying the top of a spike.\n\n"
+            f"From your Sept 22 – Nov 5 demo data:\n"
+            f"• 5m ≤ 30%: 528 trades, 49.8% WR, +$1,474\n"
+            f"• 5m > 30%: 583 trades, 38.6% WR, −$2,130\n\n"
+            f"• `30` = recommended\n"
+            f"• `50` = lenient\n"
+            f"• `0` = disabled\n\n"
+            f"Send a value:",
+            parse_mode="Markdown", reply_markup=kb_back()); return WAITING_SET_PRICE5M_MAX_PCT
+
     elif data == "set_pump_exhaustion":
         ctx.user_data["setting"] = "pump_exhaustion_ratio"
         cur = state["settings"].get("pump_exhaustion_ratio", 0.05)
@@ -2577,6 +2716,7 @@ async def _button_handler_inner(update, ctx, q, data):
         pos = state["positions"][mint]
         await q.edit_message_text(f"⏳ Selling {pos['symbol']}...", parse_mode="Markdown")
         price = await get_token_price(mint) or pos["entry_price"]
+        pos.pop("_sell_retry_at", None)   # a manual sell skips the auto-retry wait
         await _close_position(app, mint, pos, price, "✂️ Manual Sell", False)
         await q.edit_message_text(await build_dashboard(), parse_mode="Markdown", reply_markup=kb_main())
 
@@ -2712,10 +2852,23 @@ async def _button_handler_inner(update, ctx, q, data):
 async def handle_setting_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = ctx.user_data.get("setting"); txt = update.message.text.strip()
     try:
-        val = float(txt)
+        val = float(txt.rstrip("%").strip())
+        # Min ML Score is stored as a 0–1 fraction. Accept "65" or "65%" as 0.65
+        # (typing 65 used to store 6500%, which silently blocked every entry).
+        if key == "min_score":
+            if val > 1: val = val / 100.0
+            if not 0 <= val <= 1:
+                await update.message.reply_text("❌ Min Score must be 0–1 (or 0–100%).", reply_markup=kb_main())
+                return ConversationHandler.END
+            state["settings"][key] = val
+            await db_save_settings()
+            await update.message.reply_text(f"✅ *Min Score* updated to `{val:.0%}`",
+                parse_mode="Markdown", reply_markup=kb_main())
+            return ConversationHandler.END
         # price5m_filter_min_age_sec: user inputs minutes, store as seconds
         if key == "price5m_filter_min_age_sec":
             state["settings"][key] = int(val * 60)
+            await db_save_settings()   # was missing — this setting was lost on restart
             young_pct = state["settings"].get("price5m_young_min_pct", -5.0)
             old_pct   = state["settings"].get("price5m_old_min_pct", 1.0)
             await update.message.reply_text(
@@ -2993,6 +3146,7 @@ def main():
             WAITING_SET_PRICE1H_FILTER_AGE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRICE1H_OLD_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PRICE1H_MAX_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
+            WAITING_SET_PRICE5M_MAX_PCT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_PUMP_EXHAUSTION:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_MAX_MOMENTUM_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
             WAITING_SET_ENTRY_BS_RATIO:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setting_input)],
